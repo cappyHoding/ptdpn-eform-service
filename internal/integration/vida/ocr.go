@@ -58,7 +58,7 @@ func (s *OCRService) ExtractKTP(ctx context.Context, imageReader io.Reader, file
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal OCR request: %w", err)
 	}
-
+	// fmt.Printf("[VIDA OCR Request] body=%s\n", string(reqBody))
 	// Debug: log ukuran untuk deteksi image terlalu besar
 	fmt.Printf("[VIDA OCR DEBUG] image_bytes=%d b64_len=%d request_body_len=%d\n",
 		len(imageBytes), len(b64Image), len(reqBody))
@@ -81,6 +81,7 @@ func (s *OCRService) ExtractKTP(ctx context.Context, imageReader io.Reader, file
 
 	// ── 4. Baca dan parse response ────────────────────────────────────────────
 	rawBody, err := io.ReadAll(httpResp.Body)
+	fmt.Printf("[VIDA OCR RESPONSE] status=%d body=%s\n", httpResp.StatusCode, string(rawBody))
 	if err != nil {
 		return nil, fmt.Errorf("failed to read OCR response: %w", err)
 	}
@@ -118,4 +119,8 @@ func detectImageMIME(filename string) string {
 		return "image/png"
 	}
 	return "image/jpeg"
+}
+
+func (s *OCRService) Client() *Client {
+	return s.client
 }

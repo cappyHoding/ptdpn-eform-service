@@ -37,7 +37,7 @@ CREATE TABLE deposit_details (
     product_name        VARCHAR(100)    NOT NULL DEFAULT 'Deposito Perdana',
     placement_amount    BIGINT UNSIGNED NOT NULL COMMENT 'In IDR',
     tenor_months        TINYINT UNSIGNED NOT NULL COMMENT 'Must be 1, 3, 6, or 12',
-    rollover_type       ENUM('ARO','NON_ARO') NOT NULL
+    rollover_type       ENUM('ARO','NON_ARO', 'ARO_RATE') NOT NULL
                             COMMENT 'ARO = Automatic Roll Over, NON_ARO = Tidak Diperpanjang',
     interest_rate       DECIMAL(5,2)    NULL
                             COMMENT 'Snapshot of rate at time of application from system_config',

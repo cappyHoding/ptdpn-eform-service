@@ -127,7 +127,9 @@ type VidaConfig struct {
 	OCR      VidaServiceConfig // OCR + Fraud Mitigation (same credential)
 	Sign     VidaSignConfig
 	EMaterai VidaeMateraiConfig
+	WebSDK   VidaWebSDKConfig
 
+	SigningKey    string
 	WebhookSecret string        // VIDA_WEBHOOK_SECRET
 	HTTPTimeout   time.Duration // VIDA_HTTP_TIMEOUT
 }
@@ -138,6 +140,11 @@ type VidaServiceConfig struct {
 	BaseURL   string // VIDA_OCR_BASE_URL
 	ClientID  string // VIDA_OCR_CLIENT_ID
 	SecretKey string // VIDA_OCR_SECRET_KEY
+}
+
+type VidaWebSDKConfig struct {
+	ClientID  string // VIDA_WEB_SDK_CLIENT_ID
+	SecretKey string // VIDA_WEB_SDK_SECRET_KEY
 }
 
 // VidaSignConfig holds credentials for the PoA eSignature API.
@@ -304,6 +311,11 @@ func Load() (*Config, error) {
 			SecretKey: v.GetString("VIDA_EMETERAI_SECRET_KEY"),
 			PartnerID: v.GetString("VIDA_EMETERAI_PARTNER_ID"),
 		},
+		WebSDK: VidaWebSDKConfig{ // ← TAMBAHKAN INI
+			ClientID:  v.GetString("VIDA_WEB_SDK_CLIENT_ID"),
+			SecretKey: v.GetString("VIDA_WEB_SDK_CLIENT_SECRET"),
+		},
+		SigningKey:    v.GetString("VIDA_SIGNING_KEY"),
 		WebhookSecret: v.GetString("VIDA_WEBHOOK_SECRET"),
 		HTTPTimeout:   v.GetDuration("VIDA_HTTP_TIMEOUT"),
 	}

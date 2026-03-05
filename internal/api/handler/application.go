@@ -45,7 +45,7 @@ type depositInput struct {
 	ProductName       string `json:"product_name"       binding:"required"`
 	PlacementAmount   uint64 `json:"placement_amount"   binding:"required,min=1"`
 	TenorMonths       uint8  `json:"tenor_months"       binding:"required,oneof=1 3 6 12"`
-	RolloverType      string `json:"rollover_type"      binding:"required,oneof=ARO NON-ARO"`
+	RolloverType      string `json:"rollover_type"      binding:"required,oneof=ARO NON_ARO ARO_RATE"`
 	SourceOfFunds     string `json:"source_of_funds"    binding:"required"`
 	InvestmentPurpose string `json:"investment_purpose"`
 }
@@ -80,7 +80,8 @@ type personalInfoRequest struct {
 type livenessRequest struct {
 	// Selfie base64 dari VIDA Web SDK — tanpa data URI prefix
 	// (tanpa "data:image/jpeg;base64,")
-	SelfieBase64 string `json:"selfie_base64" binding:"required"`
+	SelfieBase64  string `json:"selfie_base64" binding:"required"`
+	TransactionID string `json:"transaction_id"`
 }
 
 type disbursementRequest struct {
@@ -229,6 +230,18 @@ func (h *ApplicationHandler) SubmitOCR(c *gin.Context) {
 		"address":      ocrData.Address,
 		"confidence":   ocrData.ConfidenceScore,
 	})
+}
+
+func (h *ApplicationHandler) GetLivenessToken(c *gin.Context) {
+	appID := c.Param("id")
+
+	result, err := h.appService.GetLivenessToken(c.Request.Context(), appID)
+	if err != nil {
+		handleAppError(c, err)
+		return
+	}
+
+	response.OK(c, "VIDA token retrieved", result)
 }
 
 // UpdatePersonalInfo handles Step 4: PATCH /api/v1/applications/:id/personal-info

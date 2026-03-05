@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cappyHoding/ptdpn-eform-service/config"
 	"github.com/cappyHoding/ptdpn-eform-service/internal/integration/vida"
 	"github.com/cappyHoding/ptdpn-eform-service/internal/model"
 	"github.com/cappyHoding/ptdpn-eform-service/internal/repository"
@@ -106,6 +107,14 @@ type PersonalInfoInput struct {
 	WorkAddress       string
 }
 
+type LivenessTokenOutput struct {
+	AccessToken string `json:"access_token"`
+	TokenType   string `json:"token_type"`
+	ExpiresIn   int    `json:"expires_in"`
+	ExpiresAt   int64  `json:"expires_at"`
+	SigningKey  string `json:"signing_key"`
+}
+
 // OCRInput captures Step 3: KTP image dari frontend dalam bentuk base64.
 // Frontend mengirim JSON body dengan field image_base64 dan filename.
 type OCRInput struct {
@@ -164,6 +173,7 @@ type ApplicationService interface {
 
 	// Step 4
 	UpdatePersonalInfo(ctx context.Context, appID string, input PersonalInfoInput) error
+	GetLivenessToken(ctx context.Context, appID string) (*LivenessTokenOutput, error)
 
 	// Step 5 - Liveness result stored after VIDA Web SDK completes
 	SaveLivenessResult(ctx context.Context, appID string, input LivenessInput) error
@@ -184,6 +194,7 @@ type applicationService struct {
 	vida         *vida.Services
 	storage      *storage.Manager
 	log          *logger.Logger
+	cfg          *config.Config
 }
 
 // NewApplicationService creates a new ApplicationService.
@@ -194,6 +205,7 @@ func NewApplicationService(
 	vidaServices *vida.Services,
 	storageManager *storage.Manager,
 	log *logger.Logger,
+	cfg *config.Config,
 ) ApplicationService {
 	return &applicationService{
 		appRepo:      appRepo,
@@ -202,6 +214,7 @@ func NewApplicationService(
 		vida:         vidaServices,
 		storage:      storageManager,
 		log:          log,
+		cfg:          cfg,
 	}
 }
 
@@ -545,6 +558,17 @@ func (s *applicationService) SaveLivenessResult(ctx context.Context, appID strin
 		zap.String("mobile", mobile),
 	)
 
+	s.log.Info("Fraud API request debug",
+		zap.String("app_id", appID),
+		zap.String("nik", nik),
+		zap.String("full_name", fullName),
+		zap.String("dob", dob),
+		zap.String("mobile", mobile),
+		zap.String("email", email),
+		zap.Int("selfie_b64_len", len(input.SelfieBase64)),
+		zap.Bool("selfie_empty", input.SelfieBase64 == ""),
+	)
+
 	// ── Call VIDA Fraud Mitigation API ────────────────────────────────────────
 	fraudData, err := s.vida.Fraud.VerifyIdentity(ctx,
 		input.SelfieBase64, nik, fullName, dob, mobile, email,
@@ -804,6 +828,43 @@ func (s *applicationService) writeAudit(ctx context.Context, entry *model.AuditL
 			zap.Error(err),
 		)
 	}
+}
+
+func (s *applicationService) GetLivenessToken(ctx context.Context, appID string) (*LivenessTokenOutput, error) {
+	// Pastikan application ada
+	_, err := s.appRepo.FindByID(ctx, appID)
+	if err != nil {
+		if errors.Is(err, repository.ErrApplicationNotFound) {
+			return nil, ErrApplicationNotFound
+		}
+		return nil, fmt.Errorf("load application failed: %w", err)
+	}
+
+	// Ambil token dari VIDA OCR client (credential OCR dan Fraud sama)
+	token, expiresAt, expiresIn, err := s.vida.OCR.Client().GetTokenWithCredentials(
+		ctx,
+		s.cfg.Vida.WebSDK.ClientID,
+		s.cfg.Vida.WebSDK.SecretKey,
+	)
+	if err != nil {
+		s.log.Error("Failed to get Web SDK token", // ← TAMBAHKAN INI
+			zap.String("app_id", appID),
+			zap.Error(err),
+		)
+		s.log.Info("WebSDK credentials check",
+			zap.String("client_id", s.cfg.Vida.WebSDK.ClientID),
+			zap.Bool("secret_empty", s.cfg.Vida.WebSDK.SecretKey == ""),
+		)
+		return nil, fmt.Errorf("failed to get Web SDK token: %w", err)
+	}
+
+	return &LivenessTokenOutput{
+		AccessToken: token,
+		SigningKey:  s.cfg.Vida.SigningKey,
+		TokenType:   "Bearer",
+		ExpiresIn:   expiresIn,
+		ExpiresAt:   expiresAt,
+	}, nil
 }
 
 // openFileFromPath membuka file dari path untuk dibaca ulang.

@@ -93,6 +93,30 @@ func (c *Client) fetchNewToken(ctx context.Context) (string, error) {
 	return tokenResp.AccessToken, nil
 }
 
+func (c *Client) GetAccessToken(ctx context.Context) (string, error) {
+	return c.getAccessToken(ctx)
+}
+
+func (c *Client) GetTokenInfo(ctx context.Context) (token string, expiresAt int64, expiresIn int, err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Gunakan cache jika masih valid
+	if c.tokenCache != nil && time.Now().Before(c.tokenCache.expiresAt.Add(-30*time.Second)) {
+		remaining := int(time.Until(c.tokenCache.expiresAt).Seconds())
+		return c.tokenCache.token, c.tokenCache.expiresAt.Unix(), remaining, nil
+	}
+
+	// Fetch baru
+	tok, err := c.fetchNewToken(ctx)
+	if err != nil {
+		return "", 0, 0, err
+	}
+
+	remaining := int(time.Until(c.tokenCache.expiresAt).Seconds())
+	return tok, c.tokenCache.expiresAt.Unix(), remaining, nil
+}
+
 // doJSON melakukan HTTP request dengan JSON body.
 func (c *Client) doJSON(ctx context.Context, method, path string, body interface{}, result interface{}) error {
 	return c.doJSONWithHeaders(ctx, method, path, nil, body, result)
@@ -254,4 +278,42 @@ func (c *Client) DoRawGet(ctx context.Context, path string) ([]byte, int, error)
 	}
 
 	return body, resp.StatusCode, nil
+}
+
+func (c *Client) GetTokenWithCredentials(ctx context.Context, clientID, clientSecret string) (token string, expiresAt int64, expiresIn int, err error) {
+	formData := url.Values{}
+	formData.Set("grant_type", "client_credentials")
+	formData.Set("client_id", clientID)
+	formData.Set("client_secret", clientSecret)
+	formData.Set("scope", c.scope)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.ssoURL, strings.NewReader(formData.Encode()))
+	if err != nil {
+		return "", 0, 0, fmt.Errorf("failed to create token request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", 0, 0, fmt.Errorf("token request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", 0, 0, fmt.Errorf("failed to read token response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", 0, 0, fmt.Errorf("token endpoint returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	var tokenResp TokenResponse
+	if err := json.Unmarshal(body, &tokenResp); err != nil {
+		return "", 0, 0, fmt.Errorf("failed to parse token response: %w", err)
+	}
+
+	expAt := time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second).Unix()
+	return tokenResp.AccessToken, expAt, tokenResp.ExpiresIn, nil
 }
