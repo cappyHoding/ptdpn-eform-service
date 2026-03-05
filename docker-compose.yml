@@ -1,0 +1,85 @@
+# version: '3.9'
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BPR Perdana E-Form — Docker Compose (Development)
+# ─────────────────────────────────────────────────────────────────────────────
+# USAGE:
+#   Start all:   docker compose up -d
+#   Stop all:    docker compose down
+#   View logs:   docker compose logs -f app
+#   MySQL shell: docker compose exec mysql mysql -u eform_user -p bpr_perdana_eform
+
+services:
+
+  # ── MySQL 8.0 ──────────────────────────────────────────────────────────────
+  mysql:
+    image: mysql:8.0
+    container_name: bpr-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword       # Change this!
+      MYSQL_DATABASE: bpr_perdana_eform
+      MYSQL_USER: eform_user
+      MYSQL_PASSWORD: eform_password          # Change this!
+    ports:
+      - "3308:3306"                           # Exposed so you can connect from DBeaver/Sequel Ace
+    volumes:
+      - mysql_data:/var/lib/mysql             # Persist data between restarts
+      - ./migrations:/docker-entrypoint-initdb.d  # Auto-run migrations on first start
+    command: >
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+      --default-authentication-plugin=mysql_native_password
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Redis ──────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: bpr-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes    # Enable persistence
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Backend App ────────────────────────────────────────────────────────────
+  # Comment this out if you prefer to run `go run` directly during development
+  # Only use this for testing the Docker build
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bpr-app
+    restart: unless-stopped
+    env_file: .env                            # Load from your local .env file
+    environment:
+      # Override specific values for Docker networking
+      # Inside Docker, services talk to each other by service name, not localhost
+      DB_HOST: mysql
+      REDIS_HOST: redis
+    ports:
+      - "8080:8080"
+    volumes:
+      - app_storage:/var/app/storage          # Persist uploaded files
+      - ./keys:/app/keys:ro                   # Mount RSA keys (read-only)
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+# ── Named Volumes ──────────────────────────────────────────────────────────────
+volumes:
+  mysql_data:
+  redis_data:
+  app_storage:

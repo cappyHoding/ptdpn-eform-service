@@ -1,0 +1,872 @@
+package service
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/cappyHoding/ptdpn-eform-service/internal/integration/vida"
+	"github.com/cappyHoding/ptdpn-eform-service/internal/model"
+	"github.com/cappyHoding/ptdpn-eform-service/internal/repository"
+	"github.com/cappyHoding/ptdpn-eform-service/pkg/crypto"
+	"github.com/cappyHoding/ptdpn-eform-service/pkg/logger"
+	"github.com/cappyHoding/ptdpn-eform-service/pkg/storage"
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+)
+
+// ─── Input / Output DTOs ──────────────────────────────────────────────────────
+
+// AgreementInput captures Step 1 data (T&C acceptance).
+type AgreementInput struct {
+	IPAddress string
+	UserAgent string
+}
+
+// AgreementOutput is returned after Step 1.
+// The agreement token is a short-lived proof that the customer accepted T&C.
+type AgreementOutput struct {
+	AgreementToken string `json:"agreement_token"`
+	AcceptedAt     int64  `json:"accepted_at"`
+}
+
+// CreateApplicationInput captures Step 2: product selection ONLY.
+// Contact info (email, phone) is collected in Step 4 (personal info).
+type CreateApplicationInput struct {
+	// Agreement proof from Step 1
+	AgreementToken string
+
+	// Product selection
+	ProductType string // SAVING | DEPOSIT | LOAN
+	IPAddress   string
+	UserAgent   string
+
+	// Product-specific fields
+	Saving  *SavingInput
+	Deposit *DepositInput
+	Loan    *LoanInput
+}
+
+type SavingInput struct {
+	ProductName    string
+	InitialDeposit uint64
+	SourceOfFunds  string
+	SavingPurpose  string
+}
+
+type DepositInput struct {
+	ProductName       string
+	PlacementAmount   uint64
+	TenorMonths       uint8
+	RolloverType      string
+	SourceOfFunds     string
+	InvestmentPurpose string
+}
+
+type LoanInput struct {
+	ProductName     string
+	RequestedAmount uint64
+	TenorMonths     uint8
+	LoanPurpose     string
+	PaymentSource   string
+	SourceOfFunds   string
+}
+
+// CreateApplicationOutput is returned after Step 2.
+// The frontend stores session_token and sends it in every subsequent request.
+type CreateApplicationOutput struct {
+	ApplicationID string `json:"application_id"`
+	SessionToken  string `json:"session_token"`
+	ExpiresAt     int64  `json:"expires_at"`
+	ProductType   string `json:"product_type"`
+	CurrentStep   uint8  `json:"current_step"`
+}
+
+// PersonalInfoInput captures Step 4: contact info + additional PII not on KTP.
+// Email and phone are collected here because we need KTP identity (Step 3)
+// to be established before recording contact details.
+type PersonalInfoInput struct {
+	// Contact info
+	Email       string
+	PhoneNumber string
+	PhoneWA     string
+
+	// Additional PII
+	MothersMaidenName string
+	Occupation        string
+	WorkDuration      string
+	MonthlyIncome     uint64
+	Education         string
+	WorkAddress       string
+}
+
+// OCRInput captures Step 3: KTP image dari frontend dalam bentuk base64.
+// Frontend mengirim JSON body dengan field image_base64 dan filename.
+type OCRInput struct {
+	ImageBase64 string // base64 string dari frontend (boleh ada/tanpa data URI prefix)
+	Filename    string // nama file asli untuk deteksi MIME type, e.g. "ktp.jpg"
+}
+
+// LivenessInput captures Step 5.
+// Frontend mengirim selfie base64 setelah Web SDK selesai.
+// Backend memverifikasi ke VIDA Fraud Mitigation API menggunakan
+// data identitas dari hasil OCR Step 3.
+type LivenessInput struct {
+	SelfieBase64 string // base64 selfie dari frontend (tanpa data URI prefix)
+}
+
+// DisbursementInput captures Step 6: external bank account.
+type DisbursementInput struct {
+	BankName      string
+	BankCode      string
+	AccountNumber string
+	AccountHolder string
+}
+
+// ApplicationSummary is the full view of an application for Step 7 review.
+type ApplicationSummary struct {
+	Application *model.Application `json:"application"`
+}
+
+// ─── Service Errors ───────────────────────────────────────────────────────────
+
+var (
+	ErrApplicationNotFound  = errors.New("application not found")
+	ErrInvalidStep          = errors.New("cannot perform this action at the current step")
+	ErrMissingRequiredData  = errors.New("required data for this product type is missing")
+	ErrDisbursementRequired = errors.New("disbursement data is required for this product type")
+	ErrStepNotComplete      = errors.New("previous steps must be completed first")
+	ErrAlreadySubmitted     = errors.New("this application has already been submitted")
+)
+
+// ─── Service Interface ────────────────────────────────────────────────────────
+
+// ApplicationService defines all operations for the customer-facing form flow.
+type ApplicationService interface {
+	// Step 1
+	AcceptAgreement(ctx context.Context, input AgreementInput) (*AgreementOutput, error)
+
+	// Step 2
+	CreateApplication(ctx context.Context, input CreateApplicationInput) (*CreateApplicationOutput, error)
+
+	// Get current state (for resume)
+	GetApplication(ctx context.Context, id string) (*model.Application, error)
+	GetApplicationWithDetails(ctx context.Context, id string) (*model.Application, error)
+
+	// Step 3 - upload KTP image, call VIDA OCR, save result
+	ProcessOCR(ctx context.Context, appID string, input OCRInput) (*vida.OCRData, error)
+
+	// Step 4
+	UpdatePersonalInfo(ctx context.Context, appID string, input PersonalInfoInput) error
+
+	// Step 5 - Liveness result stored after VIDA Web SDK completes
+	SaveLivenessResult(ctx context.Context, appID string, input LivenessInput) error
+
+	// Step 6
+	UpdateDisbursement(ctx context.Context, appID string, input DisbursementInput) error
+
+	// Step 7
+	Submit(ctx context.Context, appID string) error
+}
+
+// ─── Implementation ───────────────────────────────────────────────────────────
+
+type applicationService struct {
+	appRepo      repository.ApplicationRepository
+	customerRepo repository.CustomerRepository
+	auditRepo    repository.AuditRepository
+	vida         *vida.Services
+	storage      *storage.Manager
+	log          *logger.Logger
+}
+
+// NewApplicationService creates a new ApplicationService.
+func NewApplicationService(
+	appRepo repository.ApplicationRepository,
+	customerRepo repository.CustomerRepository,
+	auditRepo repository.AuditRepository,
+	vidaServices *vida.Services,
+	storageManager *storage.Manager,
+	log *logger.Logger,
+) ApplicationService {
+	return &applicationService{
+		appRepo:      appRepo,
+		customerRepo: customerRepo,
+		auditRepo:    auditRepo,
+		vida:         vidaServices,
+		storage:      storageManager,
+		log:          log,
+	}
+}
+
+// AcceptAgreement handles Step 1: records that a customer accepted T&C.
+// Returns a short-lived token proving agreement acceptance.
+// This token is required when creating the application in Step 2.
+func (s *applicationService) AcceptAgreement(ctx context.Context, input AgreementInput) (*AgreementOutput, error) {
+	// Generate a short-lived agreement token (valid for 30 minutes)
+	// This proves the customer saw and accepted the T&C before creating an application
+	token, err := crypto.GenerateSecureToken(16)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate agreement token: %w", err)
+	}
+
+	s.log.Info("Agreement accepted",
+		zap.String("ip", input.IPAddress),
+	)
+
+	return &AgreementOutput{
+		AgreementToken: token,
+		AcceptedAt:     time.Now().Unix(),
+	}, nil
+}
+
+// CreateApplication handles Step 2: creates the core application record,
+// product detail record, customer record, and issues a session token.
+//
+// BUSINESS RULES:
+//  1. Agreement token must be present (proof of T&C acceptance)
+//  2. Product type must be valid
+//  3. Product-specific detail must be provided
+//  4. Returns a session token for subsequent step authentication
+func (s *applicationService) CreateApplication(ctx context.Context, input CreateApplicationInput) (*CreateApplicationOutput, error) {
+	// Validate product type and required fields
+	if err := validateProductInput(input); err != nil {
+		return nil, err
+	}
+
+	now := time.Now()
+
+	// ── Create Customer record ────────────────────────────────────────────────
+	// At Step 2 we only know the product they want — no PII yet.
+	// Email, phone, and KTP data are collected in Steps 3 and 4.
+	customer := &model.Customer{
+		ID: uuid.New().String(),
+	}
+	if err := s.customerRepo.Create(ctx, customer); err != nil {
+		return nil, fmt.Errorf("failed to create customer: %w", err)
+	}
+
+	// ── Create Application record ─────────────────────────────────────────────
+	agreementAt := now
+	app := &model.Application{
+		ID:                  uuid.New().String(),
+		CustomerID:          customer.ID,
+		ProductType:         model.ProductType(input.ProductType),
+		Status:              model.StatusDraft,
+		CurrentStep:         3, // Step 2 selesai, customer lanjut ke Step 3
+		LastStepCompleted:   2, // Step 2 (create application) sudah selesai
+		AgreementAccepted:   true,
+		AgreementAcceptedAt: &agreementAt,
+		AgreementIP:         strPtrIfNotEmpty(input.IPAddress),
+		AgreementUserAgent:  strPtrIfNotEmpty(input.UserAgent),
+	}
+	if err := s.appRepo.Create(ctx, app); err != nil {
+		return nil, fmt.Errorf("failed to create application: %w", err)
+	}
+
+	// ── Create product-specific detail record ─────────────────────────────────
+	if err := s.createProductDetail(ctx, app.ID, input); err != nil {
+		return nil, err
+	}
+
+	// ── Generate customer session token ───────────────────────────────────────
+	// TTL: 2 hours — customers have 2 hours to complete the form
+	sessionTTL := 2 * time.Hour
+	rawToken, err := crypto.GenerateSecureToken(32)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate session token: %w", err)
+	}
+
+	expiresAt := now.Add(sessionTTL)
+	session := &model.CustomerSession{
+		ID:            uuid.New().String(),
+		ApplicationID: app.ID,
+		Token:         rawToken,
+		TokenHash:     crypto.HashToken(rawToken),
+		IPAddress:     strPtrIfNotEmpty(input.IPAddress),
+		UserAgent:     strPtrIfNotEmpty(input.UserAgent),
+		ExpiresAt:     expiresAt,
+	}
+	if err := s.appRepo.CreateSession(ctx, session); err != nil {
+		return nil, fmt.Errorf("failed to create session: %w", err)
+	}
+
+	// ── Write audit log ───────────────────────────────────────────────────────
+	s.writeAudit(ctx, &model.AuditLog{
+		ActorType:   "customer",
+		ActorID:     strPtrIfNotEmpty(customer.ID),
+		Action:      "APP_CREATED",
+		EntityType:  strPtrIfNotEmpty("application"),
+		EntityID:    strPtrIfNotEmpty(app.ID),
+		Description: strPtrIfNotEmpty(fmt.Sprintf("Application created for product: %s", input.ProductType)),
+		IPAddress:   strPtrIfNotEmpty(input.IPAddress),
+	})
+
+	s.log.Info("Application created",
+		zap.String("application_id", app.ID),
+		zap.String("product_type", input.ProductType),
+		zap.String("customer_id", customer.ID),
+	)
+
+	return &CreateApplicationOutput{
+		ApplicationID: app.ID,
+		SessionToken:  rawToken, // Raw token returned to client — hash stored in DB
+		ExpiresAt:     expiresAt.Unix(),
+		ProductType:   input.ProductType,
+		CurrentStep:   3, // Step 2 selesai, lanjut ke Step 3 (OCR)
+	}, nil
+}
+
+// GetApplication returns basic application info for step validation.
+func (s *applicationService) GetApplication(ctx context.Context, id string) (*model.Application, error) {
+	app, err := s.appRepo.FindByID(ctx, id)
+	if err != nil {
+		if errors.Is(err, repository.ErrApplicationNotFound) {
+			return nil, ErrApplicationNotFound
+		}
+		return nil, err
+	}
+	return app, nil
+}
+
+// GetApplicationWithDetails returns the full application with all related records.
+func (s *applicationService) GetApplicationWithDetails(ctx context.Context, id string) (*model.Application, error) {
+	app, err := s.appRepo.FindByIDWithDetails(ctx, id)
+	if err != nil {
+		if errors.Is(err, repository.ErrApplicationNotFound) {
+			return nil, ErrApplicationNotFound
+		}
+		return nil, err
+	}
+	return app, nil
+}
+
+// ProcessOCR handles Step 3:
+//  1. Simpan file KTP ke local storage
+//  2. Kirim ke VIDA OCR API
+//  3. Simpan hasil OCR ke database
+//  4. Update customer record dengan data KTP
+//  5. Advance ke Step 4
+func (s *applicationService) ProcessOCR(ctx context.Context, appID string, input OCRInput) (*vida.OCRData, error) {
+	app, err := s.validateAppForStep(ctx, appID, 3)
+	if err != nil {
+		return nil, err
+	}
+
+	// Guard: pastikan vida services sudah di-inject via NewApplicationService
+	if s.vida == nil {
+		s.log.Error("VIDA services not initialized — check main.go NewApplicationService arguments",
+			zap.String("app_id", appID),
+		)
+		return nil, fmt.Errorf("VIDA services not initialized")
+	}
+
+	// ── 1. Decode base64 dari frontend ──────────────────────────────────────
+	// Frontend bisa kirim dengan atau tanpa data URI prefix:
+	//   - Dengan prefix: "data:image/jpeg;base64,/9j/4AAQ..."
+	//   - Tanpa prefix:  "/9j/4AAQ..."
+	// Kita strip prefix jika ada, lalu decode ke bytes
+	rawB64 := input.ImageBase64
+	if idx := strings.Index(rawB64, ","); idx != -1 {
+		rawB64 = rawB64[idx+1:] // hapus "data:image/jpeg;base64,"
+	}
+	imageBytes, err := base64.StdEncoding.DecodeString(rawB64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid base64 image: %w", err)
+	}
+
+	// ── 2. Panggil VIDA OCR API ───────────────────────────────────────────────
+	// OCR service akan re-encode ke base64 dengan format yang dibutuhkan VIDA
+	ocrData, err := s.vida.OCR.ExtractKTP(ctx, bytes.NewReader(imageBytes), input.Filename)
+	if err != nil {
+		s.log.Error("VIDA OCR failed", zap.String("app_id", appID), zap.Error(err))
+		return nil, fmt.Errorf("OCR processing failed: %w", err)
+	}
+
+	// ── 3. Simpan file KTP ke storage (setelah OCR sukses) ───────────────────
+	ext := filepath.Ext(input.Filename)
+	if ext == "" {
+		ext = ".jpg"
+	}
+	ktpFilename := appID + ext
+	ktpPath, err := s.storage.SaveFile(storage.FileTypeKTP, ktpFilename, bytes.NewReader(imageBytes))
+	if err != nil {
+		// Log tapi jangan gagalkan proses — data OCR sudah berhasil
+		s.log.Error("Failed to save KTP image to storage", zap.Error(err))
+		ktpPath = ""
+	}
+	s.log.Info("KTP image saved", zap.String("path", ktpPath), zap.String("app_id", appID))
+
+	// ── 4. Simpan hasil OCR ke database ──────────────────────────────────────
+	result := &model.OCRResult{
+		ID:              uuid.New().String(),
+		ApplicationID:   appID,
+		VidaRequestID:   ocrData.TransactionID,
+		KTPImagePath:    ktpPath,
+		NIK:             strPtrIfNotEmpty(ocrData.NIK),
+		FullName:        strPtrIfNotEmpty(ocrData.Name),                         // OCRData.Name ← json:"nama"
+		BirthPlace:      strPtrIfNotEmpty(ocrData.BirthPlace),                   // OCRData.BirthPlace ← json:"tempat_lahir"
+		BirthDate:       strPtrIfNotEmpty(formatDOBForFraud(ocrData.BirthDate)), // DD-MM-YYYY → YYYY-MM-DD untuk MySQL DATE
+		Gender:          strPtrIfNotEmpty(ocrData.Gender),                       // OCRData.Gender ← json:"jenis_kelamin"
+		Address:         strPtrIfNotEmpty(ocrData.Address),                      // OCRData.Address ← json:"alamat"
+		Religion:        strPtrIfNotEmpty(ocrData.Religion),
+		MaritalStatus:   strPtrIfNotEmpty(ocrData.MaritalStatus),
+		Occupation:      strPtrIfNotEmpty(ocrData.Occupation),
+		Nationality:     strPtrIfNotEmpty(ocrData.Nationality),
+		ConfidenceScore: &ocrData.ConfidenceScore,
+		RawResponse:     model.JSON{"raw": ocrData},
+	}
+	if err := s.appRepo.UpsertOCRResult(ctx, result); err != nil {
+		return nil, fmt.Errorf("failed to save OCR result: %w", err)
+	}
+
+	// ── 5. Update customer record dengan data dari KTP ───────────────────────
+	customer, err := s.customerRepo.FindByID(ctx, app.CustomerID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find customer: %w", err)
+	}
+	customer.NIK = strPtrIfNotEmpty(ocrData.NIK)
+	customer.FullName = strPtrIfNotEmpty(ocrData.Name)
+	customer.CurrentAddress = strPtrIfNotEmpty(ocrData.Address)
+	customer.Occupation = strPtrIfNotEmpty(ocrData.Occupation)
+	if err := s.customerRepo.Update(ctx, customer); err != nil {
+		return nil, fmt.Errorf("failed to update customer from OCR: %w", err)
+	}
+
+	// ── 6. Advance ke Step 4 ──────────────────────────────────────────────────
+	if err := s.appRepo.UpdateStep(ctx, appID, 4, 3); err != nil {
+		return nil, fmt.Errorf("failed to advance step: %w", err)
+	}
+
+	s.writeAudit(ctx, &model.AuditLog{
+		ActorType:   "customer",
+		Action:      "APP_STEP_SAVED",
+		EntityType:  strPtrIfNotEmpty("application"),
+		EntityID:    strPtrIfNotEmpty(appID),
+		Description: strPtrIfNotEmpty(fmt.Sprintf("Step 3 completed: KTP OCR success (NIK: %s)", ocrData.NIK)),
+	})
+
+	s.log.Info("OCR completed", zap.String("app_id", appID), zap.String("nik", ocrData.NIK))
+	return ocrData, nil
+}
+
+// UpdatePersonalInfo handles Step 4: saves additional PII not found on KTP.
+func (s *applicationService) UpdatePersonalInfo(ctx context.Context, appID string, input PersonalInfoInput) error {
+	app, err := s.validateAppForStep(ctx, appID, 4)
+	if err != nil {
+		return err
+	}
+
+	// Update customer with additional info
+	customer, err := s.customerRepo.FindByID(ctx, app.CustomerID)
+	if err != nil {
+		return fmt.Errorf("failed to find customer: %w", err)
+	}
+
+	// Contact info
+	customer.Email = strPtrIfNotEmpty(input.Email)
+	customer.PhoneNumber = strPtrIfNotEmpty(input.PhoneNumber)
+	customer.PhoneNumberWA = strPtrIfNotEmpty(input.PhoneWA)
+
+	// Additional PII
+	customer.MothersMaidenName = strPtrIfNotEmpty(input.MothersMaidenName)
+	customer.Occupation = strPtrIfNotEmpty(input.Occupation)
+	customer.WorkDuration = strPtrIfNotEmpty(input.WorkDuration)
+	customer.Education = strPtrIfNotEmpty(input.Education)
+	customer.WorkAddress = strPtrIfNotEmpty(input.WorkAddress)
+	if input.MonthlyIncome > 0 {
+		customer.MonthlyIncome = &input.MonthlyIncome
+	}
+
+	if err := s.customerRepo.Update(ctx, customer); err != nil {
+		return fmt.Errorf("failed to update customer personal info: %w", err)
+	}
+
+	// Advance step: current=5 (liveness), last_completed=4
+	if err := s.appRepo.UpdateStep(ctx, appID, 5, 4); err != nil {
+		return fmt.Errorf("failed to advance step: %w", err)
+	}
+
+	s.writeAudit(ctx, &model.AuditLog{
+		ActorType:   "customer",
+		Action:      "APP_STEP_SAVED",
+		EntityType:  strPtrIfNotEmpty("application"),
+		EntityID:    strPtrIfNotEmpty(appID),
+		Description: strPtrIfNotEmpty("Step 4 completed: additional personal info saved"),
+	})
+
+	return nil
+}
+
+// SaveLivenessResult handles Step 5:
+//  1. Frontend mengirim selfie base64 setelah Web SDK selesai
+//  2. Backend fetch data KTP dari hasil OCR (Step 3) + data kontak (Step 4)
+//  3. Backend call VIDA Fraud Mitigation API (FULL_FRAUD_ASSESSMENT)
+//     → face match selfie vs KTP + verifikasi NIK ke Dukcapil
+//  4. Simpan hasil ke database, advance ke Step 6
+func (s *applicationService) SaveLivenessResult(ctx context.Context, appID string, input LivenessInput) error {
+	app, err := s.validateAppForStep(ctx, appID, 5)
+	if err != nil {
+		return err
+	}
+
+	// ── Ambil data OCR dan customer untuk Fraud API ───────────────────────────
+	appWithDetails, err := s.appRepo.FindByIDWithDetails(ctx, appID)
+	if err != nil {
+		return fmt.Errorf("failed to load application details: %w", err)
+	}
+	if appWithDetails.OCRResult == nil {
+		return fmt.Errorf("%w: OCR (Step 3) must be completed before liveness", ErrStepNotComplete)
+	}
+
+	customer, err := s.customerRepo.FindByID(ctx, app.CustomerID)
+	if err != nil {
+		return fmt.Errorf("failed to load customer: %w", err)
+	}
+
+	// Siapkan nilai dari OCR dan customer
+	nik := strVal(appWithDetails.OCRResult.NIK)
+	fullName := strVal(appWithDetails.OCRResult.FullName)
+	rawDOB := strVal(appWithDetails.OCRResult.BirthDate)
+	dob := formatDOBForFraud(rawDOB)
+	mobile := formatMobile(strVal(customer.PhoneNumber))
+	email := strVal(customer.Email)
+
+	// Debug: lihat nilai aktual DOB dari DB sebelum dikirim ke Fraud API
+	s.log.Info("Fraud API DOB debug",
+		zap.String("raw_from_db", rawDOB),
+		zap.String("after_format", dob),
+		zap.String("mobile", mobile),
+	)
+
+	// ── Call VIDA Fraud Mitigation API ────────────────────────────────────────
+	fraudData, err := s.vida.Fraud.VerifyIdentity(ctx,
+		input.SelfieBase64, nik, fullName, dob, mobile, email,
+	)
+	if err != nil {
+		s.log.Error("VIDA fraud verification failed",
+			zap.String("app_id", appID), zap.Error(err))
+		return fmt.Errorf("identity verification failed: %w", err)
+	}
+
+	// ── Simpan hasil ke database ──────────────────────────────────────────────
+	faceMatchStatus := "NOT_MATCHED"
+	if fraudData.FaceMatch {
+		faceMatchStatus = "MATCHED"
+	}
+	livenessStatus := "PASSED"
+	if fraudData.Decision == "REJECT" {
+		livenessStatus = "FAILED"
+	}
+
+	result := &model.LivenessResult{
+		ID:              uuid.New().String(),
+		ApplicationID:   appID,
+		VidaRequestID:   appID, // Fraud API tidak return request ID terpisah
+		LivenessStatus:  livenessStatus,
+		LivenessScore:   &fraudData.FaceMatchScore,
+		FaceMatchStatus: strPtrIfNotEmpty(faceMatchStatus),
+		FaceMatchScore:  &fraudData.FaceMatchScore,
+		RawResponse: model.JSON{
+			"face_match":       fraudData.FaceMatch,
+			"face_match_score": fraudData.FaceMatchScore,
+			"dukcapil_match":   fraudData.DukcapilMatch,
+			"risk_level":       fraudData.RiskLevel,
+			"decision":         fraudData.Decision,
+		},
+	}
+
+	if err := s.appRepo.UpsertLivenessResult(ctx, result); err != nil {
+		return fmt.Errorf("failed to save liveness result: %w", err)
+	}
+
+	if err := s.appRepo.UpdateStep(ctx, appID, 6, 5); err != nil {
+		return fmt.Errorf("failed to advance step: %w", err)
+	}
+
+	s.writeAudit(ctx, &model.AuditLog{
+		ActorType:  "customer",
+		Action:     "APP_STEP_SAVED",
+		EntityType: strPtrIfNotEmpty("application"),
+		EntityID:   strPtrIfNotEmpty(appID),
+		Description: strPtrIfNotEmpty(fmt.Sprintf(
+			"Step 5 completed: identity verification %s (face match: %v, dukcapil: %v, risk: %s)",
+			fraudData.Decision, fraudData.FaceMatch, fraudData.DukcapilMatch, fraudData.RiskLevel,
+		)),
+	})
+
+	s.log.Info("Identity verified",
+		zap.String("app_id", appID),
+		zap.String("decision", fraudData.Decision),
+		zap.Bool("face_match", fraudData.FaceMatch),
+		zap.Bool("dukcapil_match", fraudData.DukcapilMatch),
+	)
+	return nil
+}
+
+// UpdateDisbursement handles Step 6: saves the customer's bank account.
+// Required for LOAN and DEPOSIT, optional for SAVING.
+func (s *applicationService) UpdateDisbursement(ctx context.Context, appID string, input DisbursementInput) error {
+	_, err := s.validateAppForStep(ctx, appID, 6)
+	if err != nil {
+		return err
+	}
+
+	data := &model.DisbursementData{
+		ID:            uuid.New().String(),
+		ApplicationID: appID,
+		BankName:      input.BankName,
+		BankCode:      input.BankCode,
+		AccountNumber: input.AccountNumber,
+		AccountHolder: input.AccountHolder,
+	}
+
+	if err := s.appRepo.UpsertDisbursement(ctx, data); err != nil {
+		return fmt.Errorf("failed to save disbursement data: %w", err)
+	}
+
+	// Advance step: current=7 (summary), last_completed=6
+	if err := s.appRepo.UpdateStep(ctx, appID, 7, 6); err != nil {
+		return fmt.Errorf("failed to advance step: %w", err)
+	}
+
+	s.writeAudit(ctx, &model.AuditLog{
+		ActorType:   "customer",
+		Action:      "APP_STEP_SAVED",
+		EntityType:  strPtrIfNotEmpty("application"),
+		EntityID:    strPtrIfNotEmpty(appID),
+		Description: strPtrIfNotEmpty("Step 6 completed: disbursement bank account saved"),
+	})
+
+	return nil
+}
+
+// Submit handles Step 7: validates all steps are complete and marks the
+// application as PENDING_REVIEW so operators can begin review.
+//
+// BUSINESS RULES:
+//  1. Steps 1–5 must be completed (OCR and liveness are mandatory)
+//  2. For LOAN and DEPOSIT, step 6 (disbursement) is also required
+//  3. Status must be DRAFT — cannot re-submit an already submitted application
+func (s *applicationService) Submit(ctx context.Context, appID string) error {
+	app, err := s.appRepo.FindByIDWithDetails(ctx, appID)
+	if err != nil {
+		if errors.Is(err, repository.ErrApplicationNotFound) {
+			return ErrApplicationNotFound
+		}
+		return err
+	}
+
+	// Guard: cannot submit if already submitted
+	if app.Status != model.StatusDraft {
+		return ErrAlreadySubmitted
+	}
+
+	// Validate all required steps are done
+	if app.OCRResult == nil {
+		return fmt.Errorf("%w: KTP OCR (Step 3) must be completed", ErrStepNotComplete)
+	}
+	if app.LivenessResult == nil {
+		return fmt.Errorf("%w: Liveness check (Step 5) must be completed", ErrStepNotComplete)
+	}
+
+	// Disbursement required for LOAN and DEPOSIT
+	if app.ProductType == model.ProductLoan || app.ProductType == model.ProductDeposit {
+		if app.DisbursementData == nil {
+			return ErrDisbursementRequired
+		}
+	}
+
+	// All good — transition to PENDING_REVIEW
+	now := time.Now()
+	app.Status = model.StatusPendingReview
+	app.SubmittedAt = &now
+	app.CurrentStep = 8
+	app.LastStepCompleted = 7
+
+	if err := s.appRepo.Update(ctx, app); err != nil {
+		return fmt.Errorf("failed to submit application: %w", err)
+	}
+
+	s.writeAudit(ctx, &model.AuditLog{
+		ActorType:   "customer",
+		Action:      "APP_SUBMITTED",
+		EntityType:  strPtrIfNotEmpty("application"),
+		EntityID:    strPtrIfNotEmpty(appID),
+		Description: strPtrIfNotEmpty("Application submitted for review"),
+		NewValue:    model.JSON{"status": "PENDING_REVIEW"},
+	})
+
+	s.log.Info("Application submitted",
+		zap.String("application_id", appID),
+		zap.String("product_type", string(app.ProductType)),
+	)
+
+	return nil
+}
+
+// ─── Private Helpers ──────────────────────────────────────────────────────────
+
+// validateAppForStep checks the application exists, is in DRAFT status,
+// and has reached the minimum required step.
+func (s *applicationService) validateAppForStep(ctx context.Context, appID string, step uint8) (*model.Application, error) {
+	app, err := s.appRepo.FindByID(ctx, appID)
+	if err != nil {
+		if errors.Is(err, repository.ErrApplicationNotFound) {
+			return nil, ErrApplicationNotFound
+		}
+		return nil, err
+	}
+
+	// Can't modify a submitted or completed application
+	if app.Status != model.StatusDraft {
+		return nil, ErrAlreadySubmitted
+	}
+
+	// Customer must have reached this step (can't skip steps)
+	// Allow current step OR re-doing a previous step
+	if app.LastStepCompleted < step-1 {
+		return nil, fmt.Errorf("%w: please complete Step %d first", ErrStepNotComplete, step-1)
+	}
+
+	return app, nil
+}
+
+// createProductDetail creates the appropriate product-specific record.
+func (s *applicationService) createProductDetail(ctx context.Context, appID string, input CreateApplicationInput) error {
+	switch model.ProductType(input.ProductType) {
+	case model.ProductSaving:
+		if input.Saving == nil {
+			return fmt.Errorf("%w: saving details are required", ErrMissingRequiredData)
+		}
+		return s.appRepo.CreateSavingDetail(ctx, &model.SavingDetail{
+			ApplicationID:  appID,
+			ProductName:    input.Saving.ProductName,
+			InitialDeposit: input.Saving.InitialDeposit,
+			SourceOfFunds:  input.Saving.SourceOfFunds,
+			SavingPurpose:  input.Saving.SavingPurpose,
+		})
+
+	case model.ProductDeposit:
+		if input.Deposit == nil {
+			return fmt.Errorf("%w: deposit details are required", ErrMissingRequiredData)
+		}
+		return s.appRepo.CreateDepositDetail(ctx, &model.DepositDetail{
+			ApplicationID:     appID,
+			ProductName:       input.Deposit.ProductName,
+			PlacementAmount:   input.Deposit.PlacementAmount,
+			TenorMonths:       input.Deposit.TenorMonths,
+			RolloverType:      input.Deposit.RolloverType,
+			SourceOfFunds:     input.Deposit.SourceOfFunds,
+			InvestmentPurpose: strPtrIfNotEmpty(input.Deposit.InvestmentPurpose),
+		})
+
+	case model.ProductLoan:
+		if input.Loan == nil {
+			return fmt.Errorf("%w: loan details are required", ErrMissingRequiredData)
+		}
+		return s.appRepo.CreateLoanDetail(ctx, &model.LoanDetail{
+			ApplicationID:   appID,
+			ProductName:     input.Loan.ProductName,
+			RequestedAmount: input.Loan.RequestedAmount,
+			TenorMonths:     input.Loan.TenorMonths,
+			LoanPurpose:     input.Loan.LoanPurpose,
+			PaymentSource:   input.Loan.PaymentSource,
+			SourceOfFunds:   input.Loan.SourceOfFunds,
+		})
+
+	default:
+		return fmt.Errorf("%w: unknown product type: %s", ErrMissingRequiredData, input.ProductType)
+	}
+}
+
+// validateProductInput checks that required product fields are present.
+func validateProductInput(input CreateApplicationInput) error {
+	switch input.ProductType {
+	case "SAVING", "DEPOSIT", "LOAN":
+		return nil
+	default:
+		return fmt.Errorf("%w: product_type must be SAVING, DEPOSIT, or LOAN", ErrMissingRequiredData)
+	}
+}
+
+func (s *applicationService) writeAudit(ctx context.Context, entry *model.AuditLog) {
+	entry.CreatedAt = time.Now()
+	if err := s.auditRepo.Write(ctx, entry); err != nil {
+		s.log.Error("Failed to write audit log",
+			zap.String("action", entry.Action),
+			zap.Error(err),
+		)
+	}
+}
+
+// openFileFromPath membuka file dari path untuk dibaca ulang.
+func openFileFromPath(path string) (*os.File, error) {
+	return os.Open(path)
+}
+
+// strVal safely dereferences a *string pointer.
+func strVal(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}
+
+// formatDOBForFraud memastikan tanggal lahir dalam format YYYY-MM-DD
+// yang dibutuhkan VIDA Fraud Mitigation API.
+//
+// Menangani berbagai kemungkinan input:
+//   - "02-01-1980"              → DD-MM-YYYY dari VIDA OCR       → "1980-01-02"
+//   - "1980-01-02"              → YYYY-MM-DD dari MySQL DATE      → "1980-01-02" (sudah benar)
+//   - "1980-01-02 00:00:00 +0000 UTC" → dari MySQL dengan parseTime → "1980-01-02"
+//   - "1980-01-02T00:00:00Z"    → ISO 8601                        → "1980-01-02"
+func formatDOBForFraud(ktpDate string) string {
+	if len(ktpDate) < 10 {
+		return ktpDate
+	}
+
+	// Case 1: DD-MM-YYYY (dari OCR langsung, sebelum disimpan ke DB)
+	// Ciri: karakter ke-2 dan ke-5 adalah '-', dan bagian tahun ada di akhir
+	if ktpDate[2] == '-' && ktpDate[5] == '-' {
+		// "02-01-1980" → "1980-01-02"
+		return ktpDate[6:10] + "-" + ktpDate[3:5] + "-" + ktpDate[0:2]
+	}
+
+	// Case 2: YYYY-MM-DD atau YYYY-MM-DDTxx:xx:xxZ (dari MySQL, sudah urutan benar)
+	// Ambil hanya 10 karakter pertama
+	if ktpDate[4] == '-' && len(ktpDate) >= 10 {
+		return ktpDate[:10]
+	}
+
+	return ktpDate
+}
+
+// formatMobile memastikan nomor HP dalam format +62.
+func formatMobile(phone string) string {
+	if len(phone) == 0 {
+		return ""
+	}
+	// Jika dimulai dengan 08, ubah ke +628
+	if len(phone) > 1 && phone[0] == '0' {
+		return "+62" + phone[1:]
+	}
+	// Jika belum ada +, tambahkan
+	if phone[0] != '+' {
+		return "+" + phone
+	}
+	return phone
+}
+
+func strPtrIfNotEmpty(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}

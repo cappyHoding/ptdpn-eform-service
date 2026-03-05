@@ -1,0 +1,38 @@
+# Environment — NEVER commit these
+.env
+.env.local
+.env.*.local
+
+# RSA keys — NEVER commit
+keys/
+
+# Go build outputs
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+
+# Go module cache (managed by Go toolchain)
+vendor/
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Log files
+*.log
+/logs/
+
+# Storage directory (uploaded files)
+/storage/
+
+# Test coverage reports
+coverage.out
+coverage.html
