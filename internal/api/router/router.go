@@ -117,7 +117,8 @@ func setupCustomerRoutes(v1 *gin.RouterGroup, deps Dependencies) {
 		sessionRequired.GET("/:id/liveness/token", h.Application.GetLivenessToken)
 		sessionRequired.POST("/:id/liveness", h.Application.SubmitLiveness)          // Step 5
 		sessionRequired.PATCH("/:id/disbursement", h.Application.UpdateDisbursement) // Step 6
-		sessionRequired.POST("/:id/submit", h.Application.Submit)                    // Step 7
+		sessionRequired.PATCH("/:id/collateral", h.Application.SubmitCollateral)
+		sessionRequired.POST("/:id/submit", h.Application.Submit) // Step 7
 	}
 }
 

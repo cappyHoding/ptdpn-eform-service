@@ -143,6 +143,18 @@ type ApplicationSummary struct {
 	Application *model.Application `json:"application"`
 }
 
+type CollateralItemInput struct {
+	CollateralType  string // SHM | SHGB | BPKB | Deposito | Lainnya
+	EstimatedValue  uint64 // nilai agunan dalam IDR
+	OwnershipStatus string // Milik Sendiri | Milik Pasangan | dll
+	Description     string // deskripsi agunan (opsional)
+}
+
+// CollateralInput wraps semua items agunan untuk satu step.
+type CollateralInput struct {
+	Items []CollateralItemInput
+}
+
 // ─── Service Errors ───────────────────────────────────────────────────────────
 
 var (
@@ -163,6 +175,7 @@ type ApplicationService interface {
 
 	// Step 2
 	CreateApplication(ctx context.Context, input CreateApplicationInput) (*CreateApplicationOutput, error)
+	SaveCollateral(ctx context.Context, appID string, input CollateralInput) error
 
 	// Get current state (for resume)
 	GetApplication(ctx context.Context, id string) (*model.Application, error)
@@ -808,6 +821,59 @@ func (s *applicationService) createProductDetail(ctx context.Context, appID stri
 	default:
 		return fmt.Errorf("%w: unknown product type: %s", ErrMissingRequiredData, input.ProductType)
 	}
+}
+
+func (s *applicationService) SaveCollateral(ctx context.Context, appID string, input CollateralInput) error {
+	_, err := s.validateAppForStep(ctx, appID, 3)
+	if err != nil {
+		return err
+	}
+
+	items := make([]*model.CollateralItem, 0, len(input.Items))
+	for i, item := range input.Items {
+		// ownership_status tidak ada kolom tersendiri — gabungkan ke description
+		desc := item.Description
+		if item.OwnershipStatus != "" {
+			prefix := fmt.Sprintf("Kepemilikan: %s", item.OwnershipStatus)
+			if desc != "" {
+				desc = prefix + ". " + desc
+			} else {
+				desc = prefix
+			}
+		}
+
+		ci := &model.CollateralItem{
+			ID:             uuid.New().String(),
+			ApplicationID:  appID,
+			CollateralType: item.CollateralType,
+			SortOrder:      uint8(i + 1),
+		}
+		if desc != "" {
+			ci.Description = &desc
+		}
+		if item.EstimatedValue > 0 {
+			ci.EstimatedValue = &item.EstimatedValue
+		}
+		items = append(items, ci)
+	}
+
+	if err := s.appRepo.UpsertCollateralItems(ctx, appID, items); err != nil {
+		return fmt.Errorf("failed to save collateral: %w", err)
+	}
+
+	s.writeAudit(ctx, &model.AuditLog{
+		ActorType:   "customer",
+		Action:      "APP_STEP_SAVED",
+		EntityType:  strPtrIfNotEmpty("application"),
+		EntityID:    strPtrIfNotEmpty(appID),
+		Description: strPtrIfNotEmpty(fmt.Sprintf("Step 3 completed: %d collateral item(s) saved", len(items))),
+	})
+
+	s.log.Info("Collateral saved",
+		zap.String("app_id", appID),
+		zap.Int("items", len(items)),
+	)
+	return nil
 }
 
 // validateProductInput checks that required product fields are present.
