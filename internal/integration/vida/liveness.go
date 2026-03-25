@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -34,6 +35,24 @@ func (s *FraudService) VerifyIdentity(
 ) (*FraudData, error) {
 	partnerTrxID := uuid.New().String()
 	consentedAt := fmt.Sprintf("%d", time.Now().Unix())
+	selfieClean := selfieB64
+	if idx := strings.Index(selfieB64, ","); idx != -1 {
+		selfieClean = selfieB64[idx+1:]
+	}
+
+	isSandbox := strings.Contains(s.client.baseURL, "sandbox") ||
+		strings.Contains(s.client.baseURL, "np.vida") ||
+		strings.Contains(s.client.ssoURL, "qa-sso")
+
+	if isSandbox {
+		s.logger.Info("Using VIDA sandbox mock data for fraud assessment",
+			zap.String("original_nik", nik),
+			zap.String("mock_nik", "3511000101806300"),
+		)
+		nik = "3511000101806300"
+		fullName = "UserGDAA"
+		dob = "1980-01-01"
+	}
 
 	// Tangkap response mentah untuk ekstrak assessmentResults
 	var rawResp map[string]interface{}
@@ -48,7 +67,7 @@ func (s *FraudService) VerifyIdentity(
 			Mobile:          mobile,
 			Email:           email,
 			TransactionType: "FULL_FRAUD_ASSESSMENT",
-			SelfiePhoto:     selfieB64,
+			SelfiePhoto:     selfieClean,
 			Consent: FraudConsent{
 				ConsentedAt:  consentedAt,
 				ConsentGiven: true,
@@ -56,6 +75,7 @@ func (s *FraudService) VerifyIdentity(
 		},
 		&rawResp,
 	)
+
 	if err != nil {
 		return nil, fmt.Errorf("fraud mitigation submit failed: %w", err)
 	}

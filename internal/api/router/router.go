@@ -60,11 +60,11 @@ func Setup(deps Dependencies) *gin.Engine {
 
 	// 3. CORS — allows the React frontend to call our API from a different origin
 	router.Use(cors.New(cors.Config{
-		AllowOrigins:     deps.Config.App.CORSOrigins,
-		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
-		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization", "X-Request-ID"},
-		ExposeHeaders:    []string{"X-Request-ID"},
-		AllowCredentials: false,        // We use tokens, not cookies
+		AllowOrigins: deps.Config.App.CORSOrigins,
+		AllowMethods: []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
+		AllowHeaders: []string{"Origin", "Content-Type", "Authorization", "X-Request-ID", "X-Session-Token"},
+		// ExposeHeaders:    []string{"X-Request-ID"},
+		AllowCredentials: true,         // We use tokens, not cookies
 		MaxAge:           12 * 60 * 60, // 12 hours — how long browsers cache the preflight
 	}))
 
@@ -114,9 +114,10 @@ func setupCustomerRoutes(v1 *gin.RouterGroup, deps Dependencies) {
 		sessionRequired.GET("/:id", h.Application.GetByID)
 		sessionRequired.POST("/:id/ocr", h.Application.SubmitOCR)                     // Step 3
 		sessionRequired.PATCH("/:id/personal-info", h.Application.UpdatePersonalInfo) // Step 4
-		sessionRequired.POST("/:id/liveness", h.Application.SubmitLiveness)           // Step 5
-		sessionRequired.PATCH("/:id/disbursement", h.Application.UpdateDisbursement)  // Step 6
-		sessionRequired.POST("/:id/submit", h.Application.Submit)                     // Step 7
+		sessionRequired.GET("/:id/liveness/token", h.Application.GetLivenessToken)
+		sessionRequired.POST("/:id/liveness", h.Application.SubmitLiveness)          // Step 5
+		sessionRequired.PATCH("/:id/disbursement", h.Application.UpdateDisbursement) // Step 6
+		sessionRequired.POST("/:id/submit", h.Application.Submit)                    // Step 7
 	}
 }
 

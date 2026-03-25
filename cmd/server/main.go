@@ -130,7 +130,7 @@ func main() {
 	log.Info("VIDA services initialized")
 
 	authSvc := service.NewAuthService(userRepo, auditRepo, jwtManager, log)
-	appSvc := service.NewApplicationService(appRepo, customerRepo, auditRepo, vidaServices, storageManager, log)
+	appSvc := service.NewApplicationService(appRepo, customerRepo, auditRepo, vidaServices, storageManager, log, cfg)
 	contractSvc := service.NewContractService(appRepo, contractRepo, auditRepo, vidaServices, storageManager, cfg.Storage.LogoPath, log)
 	adminSvc := service.NewAdminService(appRepo, userRepo, auditRepo, configRepo, contractSvc, log)
 	log.Info("Services initialized")
