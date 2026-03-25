@@ -2,6 +2,7 @@ package handler
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 
 	"github.com/cappyHoding/ptdpn-eform-service/internal/service"
@@ -89,6 +90,17 @@ type disbursementRequest struct {
 	BankCode      string `json:"bank_code"      binding:"required"`
 	AccountNumber string `json:"account_number" binding:"required"`
 	AccountHolder string `json:"account_holder" binding:"required"`
+}
+
+type collateralItemRequest struct {
+	CollateralType  string `json:"collateral_type"  binding:"required"`
+	EstimatedValue  uint64 `json:"estimated_value"`
+	OwnershipStatus string `json:"ownership_status"`
+	Description     string `json:"description"`
+}
+
+type collateralRequest struct {
+	Items []collateralItemRequest `json:"items" binding:"required,min=1"`
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
@@ -345,6 +357,43 @@ func (h *ApplicationHandler) Submit(c *gin.Context) {
 			"status":         "PENDING_REVIEW",
 		},
 	})
+}
+
+func (h *ApplicationHandler) SubmitCollateral(c *gin.Context) {
+	appID := c.Param("id")
+
+	var req collateralRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": fmt.Sprintf("Invalid collateral data: %s", err.Error()),
+		})
+		return
+	}
+
+	items := make([]service.CollateralItemInput, 0, len(req.Items))
+	for _, item := range req.Items {
+		items = append(items, service.CollateralItemInput{
+			CollateralType:  item.CollateralType,
+			EstimatedValue:  item.EstimatedValue,
+			OwnershipStatus: item.OwnershipStatus,
+			Description:     item.Description,
+		})
+	}
+
+	if err := h.appService.SaveCollateral(c.Request.Context(), appID, service.CollateralInput{
+		Items: items,
+	}); err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, service.ErrApplicationNotFound) {
+			status = http.StatusNotFound
+		} else if errors.Is(err, service.ErrStepNotComplete) {
+			status = http.StatusBadRequest
+		}
+		c.JSON(status, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Collateral data saved"})
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

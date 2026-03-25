@@ -17,6 +17,7 @@ type ApplicationRepository interface {
 	UpdateStatus(ctx context.Context, id string, status model.ApplicationStatus) error
 	UpdateStep(ctx context.Context, id string, currentStep, lastCompleted uint8) error
 	Update(ctx context.Context, app *model.Application) error
+	UpsertCollateralItems(ctx context.Context, appID string, items []*model.CollateralItem) error
 
 	// Product detail operations
 	CreateSavingDetail(ctx context.Context, detail *model.SavingDetail) error
@@ -370,6 +371,21 @@ func (r *applicationRepository) GetDashboardStats(ctx context.Context) (map[stri
 	}
 	stats["TOTAL"] = total
 	return stats, nil
+}
+
+func (r *applicationRepository) UpsertCollateralItems(ctx context.Context, appID string, items []*model.CollateralItem) error {
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// Soft delete semua item lama milik application ini
+		if err := tx.Where("application_id = ?", appID).
+			Delete(&model.CollateralItem{}).Error; err != nil {
+			return err
+		}
+		// Insert item baru
+		if len(items) > 0 {
+			return tx.Create(&items).Error
+		}
+		return nil
+	})
 }
 
 // Ensure new methods are declared in the interface — add them inline:
