@@ -4,16 +4,17 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
-	"net"
 	"errors"
 	"fmt"
+	"net"
 	"time"
 
+	"github.com/cappyHoding/ptdpn-eform-service/config"
 	"github.com/cappyHoding/ptdpn-eform-service/internal/integration/vida"
 	"github.com/cappyHoding/ptdpn-eform-service/internal/model"
 	"github.com/cappyHoding/ptdpn-eform-service/internal/repository"
-	contractpdf "github.com/cappyHoding/ptdpn-eform-service/pkg/pdf"
 	"github.com/cappyHoding/ptdpn-eform-service/pkg/logger"
+	contractpdf "github.com/cappyHoding/ptdpn-eform-service/pkg/pdf"
 	"github.com/cappyHoding/ptdpn-eform-service/pkg/storage"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -21,8 +22,8 @@ import (
 
 // ContractService orchestrates the full contract lifecycle after approval:
 //
-//   APPROVE → GeneratePDF → eMeterai → eSign → status: SIGNING
-//   Webhook  → SaveSignedPDF → status: COMPLETED
+//	APPROVE → GeneratePDF → eMeterai → eSign → status: SIGNING
+//	Webhook  → SaveSignedPDF → status: COMPLETED
 type ContractService interface {
 	// InitiateContract dipanggil oleh ApproveApplication setelah supervisor approve.
 	InitiateContract(ctx context.Context, appID string, actorID string) error
@@ -40,8 +41,10 @@ type contractService struct {
 	auditRepo    repository.AuditRepository
 	vida         *vida.Services
 	storage      *storage.Manager
-	logoPath     string // path ke file logo perusahaan
-	serverIP     string // IP server untuk eSign requestInfo.srcIp
+	logoPath     string              // path ke file logo perusahaan
+	serverIP     string              // IP server untuk eSign requestInfo.srcIp
+	notifSvc     NotificationService // ← tambah ini
+	cfg          *config.Config
 	log          *logger.Logger
 }
 
@@ -52,6 +55,8 @@ func NewContractService(
 	vidaServices *vida.Services,
 	storageManager *storage.Manager,
 	logoPath string,
+	notifSvc NotificationService, // ← tambah ini
+	cfg *config.Config, // ← tambah ini
 	log *logger.Logger,
 ) ContractService {
 	return &contractService{
@@ -62,6 +67,8 @@ func NewContractService(
 		storage:      storageManager,
 		logoPath:     logoPath,
 		serverIP:     getOutboundIP(),
+		notifSvc:     notifSvc, // ← set ini
+		cfg:          cfg,      // ← set ini
 		log:          log,
 	}
 }
@@ -91,7 +98,21 @@ func (s *contractService) InitiateContract(ctx context.Context, appID string, ac
 		return fmt.Errorf("load application failed: %w", err)
 	}
 
-	// 2. Generate PDF kontrak
+	// 2. Dapatkan email customer
+	customerEmail := ""
+	if app.Customer.Email != nil {
+		customerEmail = *app.Customer.Email
+	}
+	if customerEmail == "" {
+		return fmt.Errorf("customer email not found — cannot register eSign")
+	}
+
+	// ── Cek mock mode dulu sebelum panggil VIDA apapun ─────────────────────
+	if s.cfg.Vida.MockContract {
+		return s.initiateMockContract(ctx, app, appID, actorID, customerEmail)
+	}
+
+	// 3. Generate PDF kontrak
 	s.log.Info("Generating contract PDF", zap.String("app_id", appID))
 	pdfBytes, err := contractpdf.GenerateContract(buildContractData(app, s.logoPath))
 	if err != nil {
@@ -108,7 +129,7 @@ func (s *contractService) InitiateContract(ctx context.Context, appID string, ac
 	}
 	s.log.Info("Contract PDF saved", zap.String("path", pdfPath))
 
-	// 3. Apply eMeterai (best-effort — tidak block jika gagal)
+	// 4. Apply eMeterai (best-effort — tidak block jika gagal)
 	var materaiID *string
 	var materaiAppliedAt *time.Time
 
@@ -134,15 +155,6 @@ func (s *contractService) InitiateContract(ctx context.Context, appID string, ac
 				s.log.Info("eMeterai applied", zap.String("serial", stampResult.SerialNumber))
 			}
 		}
-	}
-
-	// 4. Dapatkan email customer
-	customerEmail := ""
-	if app.Customer.Email != nil {
-		customerEmail = *app.Customer.Email
-	}
-	if customerEmail == "" {
-		return fmt.Errorf("customer email not found — cannot register eSign")
 	}
 
 	// 5. Register eSign
@@ -197,6 +209,64 @@ func (s *contractService) InitiateContract(ctx context.Context, appID string, ac
 		EntityID:    strPtrIfNotEmpty(appID),
 		Description: strPtrIfNotEmpty("Contract PDF generated, eMeterai applied, eSign link sent to " + customerEmail),
 		NewValue:    model.JSON{"status": "SIGNING", "sign_trx_id": signTrxID},
+	})
+
+	return nil
+}
+
+func (s *contractService) initiateMockContract(
+	ctx context.Context,
+	app *model.Application,
+	appID, actorID, customerEmail string,
+) error {
+	now := time.Now()
+	deadline := now.Add(7 * 24 * time.Hour)
+	mockSignLink := fmt.Sprintf("https://sign.vida.id/mock/%s", appID[:8])
+
+	doc := &model.ContractDocument{
+		ID:             uuid.New().String(),
+		ApplicationID:  appID,
+		DocumentType:   string(app.ProductType),
+		FilePath:       "mock/contract/" + appID + ".pdf",
+		SignStatus:     "SIGNING",
+		SignLink:       &mockSignLink,
+		SignLinkSentAt: &now,
+		SignDeadline:   &deadline,
+		GeneratedAt:    now,
+	}
+	if err := s.contractRepo.CreateContract(ctx, doc); err != nil {
+		return fmt.Errorf("failed to save mock contract: %w", err)
+	}
+
+	if err := s.appRepo.UpdateStatus(ctx, appID, model.StatusSigning); err != nil {
+		return fmt.Errorf("failed to update status to SIGNING: %w", err)
+	}
+
+	if s.notifSvc != nil {
+		customerName := "Nasabah"
+		if app.Customer.FullName != nil {
+			customerName = *app.Customer.FullName
+		}
+		_ = s.notifSvc.SendESignLink(
+			context.Background(),
+			appID, customerEmail, customerName,
+			string(app.ProductType),
+			mockSignLink, deadline,
+		)
+	}
+
+	s.log.Info("Mock contract initiated",
+		zap.String("app_id", appID),
+		zap.String("sign_link", mockSignLink),
+	)
+
+	s.writeAudit(ctx, &model.AuditLog{
+		ActorType:   "system",
+		Action:      "CONTRACT_INITIATED",
+		EntityType:  strPtrIfNotEmpty("application"),
+		EntityID:    strPtrIfNotEmpty(appID),
+		Description: strPtrIfNotEmpty("Mock contract, eSign link sent to " + customerEmail),
+		NewValue:    model.JSON{"status": "SIGNING", "mock": true},
 	})
 
 	return nil
@@ -299,24 +369,24 @@ func buildContractData(app *model.Application, logoPath string) contractpdf.Cont
 
 	// Data dari OCR KTP
 	if app.OCRResult != nil {
-		data.FullName      = derefStr(app.OCRResult.FullName)
-		data.NIK           = derefStr(app.OCRResult.NIK)
-		data.BirthPlace    = derefStr(app.OCRResult.BirthPlace)
-		data.BirthDate     = derefStr(app.OCRResult.BirthDate)
-		data.Address       = derefStr(app.OCRResult.Address)
-		data.Kelurahan     = derefStr(app.OCRResult.Kelurahan)
-		data.Kecamatan     = derefStr(app.OCRResult.Kecamatan)
+		data.FullName = derefStr(app.OCRResult.FullName)
+		data.NIK = derefStr(app.OCRResult.NIK)
+		data.BirthPlace = derefStr(app.OCRResult.BirthPlace)
+		data.BirthDate = derefStr(app.OCRResult.BirthDate)
+		data.Address = derefStr(app.OCRResult.Address)
+		data.Kelurahan = derefStr(app.OCRResult.Kelurahan)
+		data.Kecamatan = derefStr(app.OCRResult.Kecamatan)
 		data.KabupatenKota = derefStr(app.OCRResult.KabupatenKota)
-		data.Provinsi      = derefStr(app.OCRResult.Provinsi)
-		data.Occupation    = derefStr(app.OCRResult.Occupation)
-		data.Nationality   = derefStr(app.OCRResult.Nationality)
+		data.Provinsi = derefStr(app.OCRResult.Provinsi)
+		data.Occupation = derefStr(app.OCRResult.Occupation)
+		data.Nationality = derefStr(app.OCRResult.Nationality)
 	}
 
 	// Data dari Customer (personal info diisi saat Step 4)
-	data.Email             = derefStr(app.Customer.Email)
-	data.PhoneNumber       = derefStr(app.Customer.PhoneNumber)
-	data.Education         = derefStr(app.Customer.Education)
-	data.MonthlyIncome     = derefUint64(app.Customer.MonthlyIncome)
+	data.Email = derefStr(app.Customer.Email)
+	data.PhoneNumber = derefStr(app.Customer.PhoneNumber)
+	data.Education = derefStr(app.Customer.Education)
+	data.MonthlyIncome = derefUint64(app.Customer.MonthlyIncome)
 	data.MothersMaidenName = derefStr(app.Customer.MothersMaidenName)
 
 	// Detail produk
@@ -356,8 +426,8 @@ func buildContractData(app *model.Application, logoPath string) contractpdf.Cont
 
 	// Rekening pencairan
 	if app.DisbursementData != nil {
-		data.BankName      = app.DisbursementData.BankName
-		data.BankCode      = app.DisbursementData.BankCode
+		data.BankName = app.DisbursementData.BankName
+		data.BankCode = app.DisbursementData.BankCode
 		data.AccountNumber = app.DisbursementData.AccountNumber
 		data.AccountHolder = app.DisbursementData.AccountHolder
 	}
@@ -366,14 +436,20 @@ func buildContractData(app *model.Application, logoPath string) contractpdf.Cont
 }
 
 func derefStr(s *string) string {
-	if s == nil { return "" }
+	if s == nil {
+		return ""
+	}
 	return *s
 }
 func derefTime(t *time.Time) time.Time {
-	if t == nil { return time.Now() }
+	if t == nil {
+		return time.Now()
+	}
 	return *t
 }
 func derefUint64(u *uint64) uint64 {
-	if u == nil { return 0 }
+	if u == nil {
+		return 0
+	}
 	return *u
 }

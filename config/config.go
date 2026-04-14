@@ -132,6 +132,8 @@ type VidaConfig struct {
 	SigningKey    string
 	WebhookSecret string        // VIDA_WEBHOOK_SECRET
 	HTTPTimeout   time.Duration // VIDA_HTTP_TIMEOUT
+	MockFraud     bool
+	MockContract  bool // VIDA_FRAUD_MOCK — jika true, bypass panggilan Fraud Mitigation dan kembalikan hasil mock
 }
 
 // VidaServiceConfig adalah credential untuk OCR dan Fraud Mitigation API.
@@ -318,6 +320,8 @@ func Load() (*Config, error) {
 		SigningKey:    v.GetString("VIDA_SIGNING_KEY"),
 		WebhookSecret: v.GetString("VIDA_WEBHOOK_SECRET"),
 		HTTPTimeout:   v.GetDuration("VIDA_HTTP_TIMEOUT"),
+		MockFraud:     v.GetBool("VIDA_FRAUD_MOCK"),
+		MockContract:  v.GetBool("VIDA_CONTRACT_MOCK"),
 	}
 
 	// ── Email ────────────────────────────────────────────────────────────────

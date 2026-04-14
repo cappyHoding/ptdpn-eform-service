@@ -206,6 +206,7 @@ type applicationService struct {
 	auditRepo    repository.AuditRepository
 	vida         *vida.Services
 	storage      *storage.Manager
+	notifSvc     NotificationService
 	log          *logger.Logger
 	cfg          *config.Config
 }
@@ -217,6 +218,7 @@ func NewApplicationService(
 	auditRepo repository.AuditRepository,
 	vidaServices *vida.Services,
 	storageManager *storage.Manager,
+	notifSvc NotificationService,
 	log *logger.Logger,
 	cfg *config.Config,
 ) ApplicationService {
@@ -226,6 +228,7 @@ func NewApplicationService(
 		auditRepo:    auditRepo,
 		vida:         vidaServices,
 		storage:      storageManager,
+		notifSvc:     notifSvc, // ← INI YANG KURANG
 		log:          log,
 		cfg:          cfg,
 	}
@@ -542,7 +545,6 @@ func (s *applicationService) SaveLivenessResult(ctx context.Context, appID strin
 		return err
 	}
 
-	// ── Ambil data OCR dan customer untuk Fraud API ───────────────────────────
 	appWithDetails, err := s.appRepo.FindByIDWithDetails(ctx, appID)
 	if err != nil {
 		return fmt.Errorf("failed to load application details: %w", err)
@@ -556,43 +558,47 @@ func (s *applicationService) SaveLivenessResult(ctx context.Context, appID strin
 		return fmt.Errorf("failed to load customer: %w", err)
 	}
 
-	// Siapkan nilai dari OCR dan customer
-	nik := strVal(appWithDetails.OCRResult.NIK)
-	fullName := strVal(appWithDetails.OCRResult.FullName)
-	rawDOB := strVal(appWithDetails.OCRResult.BirthDate)
-	dob := formatDOBForFraud(rawDOB)
-	mobile := formatMobile(strVal(customer.PhoneNumber))
-	email := strVal(customer.Email)
+	// ── Call VIDA Fraud API atau gunakan mock ─────────────────────────────────
+	var fraudData *vida.FraudData
 
-	// Debug: lihat nilai aktual DOB dari DB sebelum dikirim ke Fraud API
-	s.log.Info("Fraud API DOB debug",
-		zap.String("raw_from_db", rawDOB),
-		zap.String("after_format", dob),
-		zap.String("mobile", mobile),
-	)
+	if s.cfg.Vida.MockFraud {
+		// Mock mode — bypass VIDA, langsung return hasil positif
+		// Diaktifkan via VIDA_FRAUD_MOCK=true di .env
+		s.log.Info("VIDA Fraud mock active — skipping real API call",
+			zap.String("app_id", appID),
+		)
+		score := 0.92
+		fraudData = &vida.FraudData{
+			FaceMatch:      true,
+			FaceMatchScore: score,
+			DukcapilMatch:  true,
+			RiskLevel:      "LOW",
+			Decision:       "ACCEPT",
+		}
+	} else {
+		nik := strVal(appWithDetails.OCRResult.NIK)
+		fullName := strVal(appWithDetails.OCRResult.FullName)
+		rawDOB := strVal(appWithDetails.OCRResult.BirthDate)
+		dob := formatDOBForFraud(rawDOB)
+		mobile := formatMobile(strVal(customer.PhoneNumber))
+		email := strVal(customer.Email)
 
-	s.log.Info("Fraud API request debug",
-		zap.String("app_id", appID),
-		zap.String("nik", nik),
-		zap.String("full_name", fullName),
-		zap.String("dob", dob),
-		zap.String("mobile", mobile),
-		zap.String("email", email),
-		zap.Int("selfie_b64_len", len(input.SelfieBase64)),
-		zap.Bool("selfie_empty", input.SelfieBase64 == ""),
-	)
+		s.log.Info("Fraud API DOB debug",
+			zap.String("raw_from_db", rawDOB),
+			zap.String("after_format", dob),
+		)
 
-	// ── Call VIDA Fraud Mitigation API ────────────────────────────────────────
-	fraudData, err := s.vida.Fraud.VerifyIdentity(ctx,
-		input.SelfieBase64, nik, fullName, dob, mobile, email,
-	)
-	if err != nil {
-		s.log.Error("VIDA fraud verification failed",
-			zap.String("app_id", appID), zap.Error(err))
-		return fmt.Errorf("identity verification failed: %w", err)
+		fraudData, err = s.vida.Fraud.VerifyIdentity(ctx,
+			input.SelfieBase64, nik, fullName, dob, mobile, email,
+		)
+		if err != nil {
+			s.log.Error("VIDA fraud verification failed",
+				zap.String("app_id", appID), zap.Error(err))
+			return fmt.Errorf("identity verification failed: %w", err)
+		}
 	}
 
-	// ── Simpan hasil ke database ──────────────────────────────────────────────
+	// ── Simpan hasil ke database (sama seperti sebelumnya) ───────────────────
 	faceMatchStatus := "NOT_MATCHED"
 	if fraudData.FaceMatch {
 		faceMatchStatus = "MATCHED"
@@ -605,7 +611,7 @@ func (s *applicationService) SaveLivenessResult(ctx context.Context, appID strin
 	result := &model.LivenessResult{
 		ID:              uuid.New().String(),
 		ApplicationID:   appID,
-		VidaRequestID:   appID, // Fraud API tidak return request ID terpisah
+		VidaRequestID:   appID,
 		LivenessStatus:  livenessStatus,
 		LivenessScore:   &fraudData.FaceMatchScore,
 		FaceMatchStatus: strPtrIfNotEmpty(faceMatchStatus),
@@ -616,6 +622,7 @@ func (s *applicationService) SaveLivenessResult(ctx context.Context, appID strin
 			"dukcapil_match":   fraudData.DukcapilMatch,
 			"risk_level":       fraudData.RiskLevel,
 			"decision":         fraudData.Decision,
+			"mock":             s.cfg.Vida.MockFraud, // ← tandai ini mock
 		},
 	}
 
@@ -633,17 +640,11 @@ func (s *applicationService) SaveLivenessResult(ctx context.Context, appID strin
 		EntityType: strPtrIfNotEmpty("application"),
 		EntityID:   strPtrIfNotEmpty(appID),
 		Description: strPtrIfNotEmpty(fmt.Sprintf(
-			"Step 5 completed: identity verification %s (face match: %v, dukcapil: %v, risk: %s)",
-			fraudData.Decision, fraudData.FaceMatch, fraudData.DukcapilMatch, fraudData.RiskLevel,
+			"Step 5 completed: identity verification %s (mock: %v)",
+			fraudData.Decision, s.cfg.Vida.MockFraud,
 		)),
 	})
 
-	s.log.Info("Identity verified",
-		zap.String("app_id", appID),
-		zap.String("decision", fraudData.Decision),
-		zap.Bool("face_match", fraudData.FaceMatch),
-		zap.Bool("dukcapil_match", fraudData.DukcapilMatch),
-	)
 	return nil
 }
 
@@ -730,6 +731,26 @@ func (s *applicationService) Submit(ctx context.Context, appID string) error {
 	if err := s.appRepo.Update(ctx, app); err != nil {
 		return fmt.Errorf("failed to submit application: %w", err)
 	}
+
+	go func() {
+		if app.Customer.Email == nil || *app.Customer.Email == "" {
+			return
+		}
+		customerName := "Nasabah"
+		if app.Customer.FullName != nil {
+			customerName = *app.Customer.FullName
+		}
+		productName := string(app.ProductType)
+		if err := s.notifSvc.SendSubmitConfirmation(
+			context.Background(),
+			appID,
+			*app.Customer.Email,
+			customerName,
+			productName,
+		); err != nil {
+			s.log.Warn("Submit confirmation email failed", zap.Error(err))
+		}
+	}()
 
 	s.writeAudit(ctx, &model.AuditLog{
 		ActorType:   "customer",
