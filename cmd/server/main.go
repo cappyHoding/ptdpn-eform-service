@@ -30,6 +30,7 @@ import (
 	"github.com/cappyHoding/ptdpn-eform-service/internal/integration/vida"
 	"github.com/cappyHoding/ptdpn-eform-service/internal/repository"
 	"github.com/cappyHoding/ptdpn-eform-service/internal/service"
+	"github.com/cappyHoding/ptdpn-eform-service/pkg/email"
 	"github.com/cappyHoding/ptdpn-eform-service/pkg/jwt"
 	"github.com/cappyHoding/ptdpn-eform-service/pkg/logger"
 	"github.com/cappyHoding/ptdpn-eform-service/pkg/storage"
@@ -116,6 +117,16 @@ func main() {
 	log.Info("Storage manager initialized",
 		zap.String("base_path", cfg.Storage.BasePath),
 	)
+
+	mailer := email.New(
+		cfg.Email.Host,
+		cfg.Email.Port,
+		cfg.Email.Username,
+		cfg.Email.Password,
+		cfg.Email.FromName,
+		cfg.Email.FromEmail,
+	)
+
 	// STEP 6: Initialize Repositories
 	userRepo := repository.NewUserRepository(db)
 	auditRepo := repository.NewAuditRepository(db)
@@ -123,6 +134,7 @@ func main() {
 	appRepo := repository.NewApplicationRepository(db)
 	configRepo := repository.NewConfigRepository(db)
 	contractRepo := repository.NewContractRepository(db)
+	notifRepo := repository.NewNotificationRepository(db)
 	log.Info("Repositories initialized")
 
 	// STEP 7: Initialize Services
@@ -130,9 +142,10 @@ func main() {
 	log.Info("VIDA services initialized")
 
 	authSvc := service.NewAuthService(userRepo, auditRepo, jwtManager, log)
-	appSvc := service.NewApplicationService(appRepo, customerRepo, auditRepo, vidaServices, storageManager, log, cfg)
-	contractSvc := service.NewContractService(appRepo, contractRepo, auditRepo, vidaServices, storageManager, cfg.Storage.LogoPath, log)
-	adminSvc := service.NewAdminService(appRepo, userRepo, auditRepo, configRepo, contractSvc, log)
+	notifSvc := service.NewNotificationService(mailer, notifRepo, log)
+	appSvc := service.NewApplicationService(appRepo, customerRepo, auditRepo, vidaServices, storageManager, notifSvc, log, cfg)
+	contractSvc := service.NewContractService(appRepo, contractRepo, auditRepo, vidaServices, storageManager, cfg.Storage.LogoPath, notifSvc, cfg, log)
+	adminSvc := service.NewAdminService(appRepo, userRepo, auditRepo, configRepo, contractSvc, notifSvc, log)
 	log.Info("Services initialized")
 
 	// STEP 8: Initialize Handlers

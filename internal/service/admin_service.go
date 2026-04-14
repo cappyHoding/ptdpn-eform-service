@@ -140,6 +140,7 @@ type adminService struct {
 	auditRepo   repository.AuditRepository
 	configRepo  repository.ConfigRepository
 	contractSvc ContractService
+	notifSvc    NotificationService
 	log         *logger.Logger
 }
 
@@ -149,6 +150,7 @@ func NewAdminService(
 	auditRepo repository.AuditRepository,
 	configRepo repository.ConfigRepository,
 	contractSvc ContractService,
+	notifSvc NotificationService,
 	log *logger.Logger,
 ) AdminService {
 	return &adminService{
@@ -157,6 +159,7 @@ func NewAdminService(
 		auditRepo:   auditRepo,
 		configRepo:  configRepo,
 		contractSvc: contractSvc,
+		notifSvc:    notifSvc,
 		log:         log,
 	}
 }
@@ -276,10 +279,6 @@ func (s *adminService) RecommendApplication(ctx context.Context, appID string, r
 // ApproveApplication: RECOMMENDED → APPROVED
 // Supervisor (checker) approves. Only supervisor/admin can call this.
 func (s *adminService) ApproveApplication(ctx context.Context, appID string, review ReviewInput) error {
-	if review.ActorRole != "supervisor" && review.ActorRole != "admin" {
-		return ErrForbiddenAction
-	}
-
 	app, err := s.appRepo.FindByID(ctx, appID)
 	if err != nil {
 		if errors.Is(err, repository.ErrApplicationNotFound) {
@@ -293,35 +292,61 @@ func (s *adminService) ApproveApplication(ctx context.Context, appID string, rev
 			ErrInvalidStatusChange, app.Status)
 	}
 
+	// Hanya supervisor dan admin yang boleh approve
+	if review.ActorRole == "operator" {
+		return ErrForbiddenAction
+	}
+
 	if err := s.appRepo.UpdateStatus(ctx, appID, model.StatusApproved); err != nil {
 		return fmt.Errorf("failed to update status: %w", err)
 	}
 
-	s.writeAudit(ctx, &model.AuditLog{
-		ActorType:     "internal_user",
-		ActorID:       &review.ActorID,
-		ActorUsername: &review.ActorUsername,
-		ActorRole:     &review.ActorRole,
-		Action:        "APP_APPROVED",
-		EntityType:    strPtrIfNotEmpty("application"),
-		EntityID:      strPtrIfNotEmpty(appID),
-		Description:   strPtrIfNotEmpty(fmt.Sprintf("Application approved by supervisor %s", review.ActorUsername)),
-		NewValue:      model.JSON{"status": "APPROVED"},
-	})
-
 	if err := s.recordReviewAction(ctx, appID, review, "APPROVED",
-		fmt.Sprintf("Application approved by supervisor %s", review.ActorUsername)); err != nil {
+		fmt.Sprintf("Application approved by %s", review.ActorUsername)); err != nil {
 		return err
 	}
 
-	// Initiate contract: generate PDF → eMeterai → eSign → status SIGNING
-	// Run in background so the approve API returns immediately
+	// ── Inisiasi contract flow (best-effort — log error tapi jangan gagalkan approve) ──
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				s.log.Error("Approval goroutine panicked",
+					zap.String("app_id", appID), zap.Any("panic", r))
+			}
+		}()
+
 		bgCtx := context.Background()
-		if contractErr := s.contractSvc.InitiateContract(bgCtx, appID, review.ActorID); contractErr != nil {
+
+		appDetail, err := s.appRepo.FindByIDWithDetails(bgCtx, appID)
+		if err != nil || appDetail.Customer.Email == nil {
+			s.log.Warn("Cannot send approval emails — customer not found or email empty",
+				zap.String("app_id", appID))
+			return
+		}
+
+		customerName := "Nasabah"
+		if appDetail.Customer.FullName != nil {
+			customerName = *appDetail.Customer.FullName
+		}
+		customerEmail := *appDetail.Customer.Email
+		productName := string(appDetail.ProductType)
+
+		// 1. Kirim email approval
+		if err := s.notifSvc.SendApprovalNotice(
+			bgCtx, appID, customerEmail, customerName, productName,
+		); err != nil {
+			s.log.Warn("Approval email failed", zap.Error(err))
+		}
+
+		// 2. Jeda — hindari rate limit Mailtrap (1 email/detik)
+		time.Sleep(5 * time.Second)
+
+		// 3. Inisiasi contract (generate PDF mock + kirim eSign email)
+		if err := s.contractSvc.InitiateContract(bgCtx, appID, review.ActorID); err != nil {
 			s.log.Error("Contract initiation failed",
 				zap.String("app_id", appID),
-				zap.Error(contractErr),
+				zap.String("actor", review.ActorUsername),
+				zap.Error(err),
 			)
 		}
 	}()
@@ -374,6 +399,32 @@ func (s *adminService) RejectApplication(ctx context.Context, appID string, revi
 		Description:   strPtrIfNotEmpty(fmt.Sprintf("Application rejected: %s", review.Notes)),
 		NewValue:      model.JSON{"status": "REJECTED", "reason": review.Notes},
 	})
+
+	go func() {
+		app, err := s.appRepo.FindByIDWithDetails(context.Background(), appID)
+		if err != nil || app.Customer.Email == nil {
+			return
+		}
+		customerName := "Nasabah"
+		if app.Customer.FullName != nil {
+			customerName = *app.Customer.FullName
+		}
+		productName := string(app.ProductType)
+		reason := review.Notes
+		if reason == "" {
+			reason = "Tidak memenuhi persyaratan yang ditetapkan"
+		}
+		if err := s.notifSvc.SendRejectionNotice(
+			context.Background(),
+			appID,
+			*app.Customer.Email,
+			customerName,
+			productName,
+			reason,
+		); err != nil {
+			s.log.Warn("Rejection email failed", zap.Error(err))
+		}
+	}()
 
 	return s.recordReviewAction(ctx, appID, review, "REJECTED", review.Notes)
 }
