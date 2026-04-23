@@ -317,6 +317,7 @@ func (s *adminService) ApproveApplication(ctx context.Context, appID string, rev
 
 		bgCtx := context.Background()
 
+		// Load application dengan semua detail untuk email
 		appDetail, err := s.appRepo.FindByIDWithDetails(bgCtx, appID)
 		if err != nil || appDetail.Customer.Email == nil {
 			s.log.Warn("Cannot send approval emails — customer not found or email empty",
@@ -324,24 +325,15 @@ func (s *adminService) ApproveApplication(ctx context.Context, appID string, rev
 			return
 		}
 
-		customerName := "Nasabah"
-		if appDetail.Customer.FullName != nil {
-			customerName = *appDetail.Customer.FullName
-		}
-		customerEmail := *appDetail.Customer.Email
-		productName := string(appDetail.ProductType)
-
-		// 1. Kirim email approval
-		if err := s.notifSvc.SendApprovalNotice(
-			bgCtx, appID, customerEmail, customerName, productName,
-		); err != nil {
+		// 1. Kirim email approval — signature baru pakai *model.Application
+		if err := s.notifSvc.SendApprovalNotice(bgCtx, appDetail); err != nil {
 			s.log.Warn("Approval email failed", zap.Error(err))
 		}
 
 		// 2. Jeda — hindari rate limit Mailtrap (1 email/detik)
 		time.Sleep(5 * time.Second)
 
-		// 3. Inisiasi contract (generate PDF mock + kirim eSign email)
+		// 3. Inisiasi contract
 		if err := s.contractSvc.InitiateContract(bgCtx, appID, review.ActorID); err != nil {
 			s.log.Error("Contract initiation failed",
 				zap.String("app_id", appID),
@@ -401,26 +393,26 @@ func (s *adminService) RejectApplication(ctx context.Context, appID string, revi
 	})
 
 	go func() {
-		app, err := s.appRepo.FindByIDWithDetails(context.Background(), appID)
-		if err != nil || app.Customer.Email == nil {
+		defer func() {
+			if r := recover(); r != nil {
+				s.log.Error("Rejection goroutine panicked",
+					zap.String("app_id", appID), zap.Any("panic", r))
+			}
+		}()
+
+		appDetail, err := s.appRepo.FindByIDWithDetails(context.Background(), appID)
+		if err != nil || appDetail.Customer.Email == nil {
 			return
 		}
-		customerName := "Nasabah"
-		if app.Customer.FullName != nil {
-			customerName = *app.Customer.FullName
-		}
-		productName := string(app.ProductType)
+
 		reason := review.Notes
 		if reason == "" {
 			reason = "Tidak memenuhi persyaratan yang ditetapkan"
 		}
+
+		// signature baru pakai *model.Application
 		if err := s.notifSvc.SendRejectionNotice(
-			context.Background(),
-			appID,
-			*app.Customer.Email,
-			customerName,
-			productName,
-			reason,
+			context.Background(), appDetail, reason,
 		); err != nil {
 			s.log.Warn("Rejection email failed", zap.Error(err))
 		}

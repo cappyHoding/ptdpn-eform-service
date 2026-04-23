@@ -106,6 +106,8 @@ func setupCustomerRoutes(v1 *gin.RouterGroup, deps Dependencies) {
 	// Step 2 — Create application (no auth, returns session token)
 	apps.POST("", h.Application.Create)
 
+	apps.GET("/track", h.Application.TrackStatus)
+
 	// Steps 3-7 — Require valid X-Session-Token header
 	// The session middleware validates the token and binds it to the application ID
 	sessionRequired := apps.Group("")
@@ -163,6 +165,10 @@ func setupAdminRoutes(v1 *gin.RouterGroup, deps Dependencies) {
 			supervisorGroup.PATCH("/:id/approve", deps.Handlers.Admin.ApproveApplication)
 			supervisorGroup.PATCH("/:id/reject", deps.Handlers.Admin.RejectApplication)
 		}
+
+		// File serving untuk foto KTP dan selfie
+		reviewGroup.GET("/:id/images/ktp", deps.Handlers.Admin.ServeKTPImage)
+		reviewGroup.GET("/:id/images/selfie", deps.Handlers.Admin.ServeSelfieImage)
 	}
 
 	// User management — admin only

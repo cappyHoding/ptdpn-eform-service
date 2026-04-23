@@ -15,10 +15,10 @@ import (
 
 // NotificationService kirim email ke nasabah dan catat ke notification_logs.
 type NotificationService interface {
-	SendSubmitConfirmation(ctx context.Context, appID, customerEmail, customerName, productName string) error
-	SendRejectionNotice(ctx context.Context, appID, customerEmail, customerName, productName, reason string) error
-	SendApprovalNotice(ctx context.Context, appID, customerEmail, customerName, productName string) error
-	SendESignLink(ctx context.Context, appID, toEmail, customerName, productName, signLink string, deadline time.Time) error
+	SendSubmitConfirmation(ctx context.Context, app *model.Application) error
+	SendRejectionNotice(ctx context.Context, app *model.Application, reason string) error
+	SendApprovalNotice(ctx context.Context, app *model.Application) error
+	SendESignLink(ctx context.Context, app *model.Application, signLink string, deadline time.Time) error
 }
 
 type notificationService struct {
@@ -42,57 +42,115 @@ func NewNotificationService(
 // ── SendSubmitConfirmation ────────────────────────────────────────────────────
 
 func (s *notificationService) SendSubmitConfirmation(
-	ctx context.Context,
-	appID, toEmail, customerName, productName string,
+	ctx context.Context, app *model.Application,
 ) error {
+	if app.Customer.Email == nil {
+		return fmt.Errorf("customer email is empty")
+	}
+	customerName := "Nasabah"
+	if app.Customer.FullName != nil {
+		customerName = *app.Customer.FullName
+	}
+	productLabel := productLabel(string(app.ProductType))
+
 	body, err := email.RenderHTML(email.TmplSubmitConfirm, email.SubmitConfirmData{
 		CustomerName: customerName,
-		ProductName:  productName,
-		AppID:        appID[:8],
+		ProductName:  productLabel,
+		AppID:        app.ID[:8],
+		Details:      buildEmailDetails(app),
+		LogoURI:      s.mailer.LogoDataURI(),
 	})
 	if err != nil {
-		return fmt.Errorf("render submit confirm template: %w", err)
+		return fmt.Errorf("render submit confirm: %w", err)
 	}
-
-	subject := fmt.Sprintf("Pengajuan %s Anda Telah Diterima - BPR Perdana", productName)
-	return s.send(ctx, appID, toEmail, "submission_confirm", subject, body)
+	subject := fmt.Sprintf("Pengajuan %s Anda Telah Diterima - BPR Perdana", productLabel)
+	return s.send(ctx, app.ID, *app.Customer.Email, "submission_confirm", subject, body)
 }
 
 // ── SendRejectionNotice ───────────────────────────────────────────────────────
 
 func (s *notificationService) SendRejectionNotice(
-	ctx context.Context,
-	appID, toEmail, customerName, productName, reason string,
+	ctx context.Context, app *model.Application, reason string,
 ) error {
+	if app.Customer.Email == nil {
+		return fmt.Errorf("customer email is empty")
+	}
+	customerName := "Nasabah"
+	if app.Customer.FullName != nil {
+		customerName = *app.Customer.FullName
+	}
+	productLabel := productLabel(string(app.ProductType))
+
 	body, err := email.RenderHTML(email.TmplRejection, email.RejectionData{
 		CustomerName: customerName,
-		ProductName:  productName,
+		ProductName:  productLabel,
 		Reason:       reason,
+		Details:      buildEmailDetails(app),
+		LogoURI:      s.mailer.LogoDataURI(),
 	})
 	if err != nil {
-		return fmt.Errorf("render rejection template: %w", err)
+		return fmt.Errorf("render rejection: %w", err)
 	}
-
 	subject := "Pemberitahuan Hasil Pengajuan - BPR Perdana"
-	return s.send(ctx, appID, toEmail, "rejection_email", subject, body)
+	return s.send(ctx, app.ID, *app.Customer.Email, "rejection_email", subject, body)
 }
 
 // ── SendApprovalNotice ────────────────────────────────────────────────────────
 
 func (s *notificationService) SendApprovalNotice(
-	ctx context.Context,
-	appID, toEmail, customerName, productName string,
+	ctx context.Context, app *model.Application,
 ) error {
+	if app.Customer.Email == nil {
+		return fmt.Errorf("customer email is empty")
+	}
+	customerName := "Nasabah"
+	if app.Customer.FullName != nil {
+		customerName = *app.Customer.FullName
+	}
+	productLabel := productLabel(string(app.ProductType))
+
 	body, err := email.RenderHTML(email.TmplApproval, email.ApprovalData{
 		CustomerName: customerName,
-		ProductName:  productName,
+		ProductName:  productLabel,
+		Details:      buildEmailDetails(app),
+		LogoURI:      s.mailer.LogoDataURI(),
 	})
+
 	if err != nil {
-		return fmt.Errorf("render approval template: %w", err)
+		return fmt.Errorf("render approval: %w", err)
 	}
 
 	subject := "Selamat! Pengajuan Anda Disetujui - BPR Perdana"
-	return s.send(ctx, appID, toEmail, "approval_email", subject, body)
+	return s.send(ctx, app.ID, *app.Customer.Email, "approval_email", subject, body)
+}
+
+func (s *notificationService) SendESignLink(
+	ctx context.Context, app *model.Application,
+	signLink string, deadline time.Time,
+) error {
+	if app.Customer.Email == nil {
+		return fmt.Errorf("customer email is empty")
+	}
+	customerName := "Nasabah"
+	if app.Customer.FullName != nil {
+		customerName = *app.Customer.FullName
+	}
+	productLabel := productLabel(string(app.ProductType))
+
+	body, err := email.RenderHTML(email.TmplESignLink, email.ESignLinkData{
+		CustomerName: customerName,
+		ProductName:  productLabel,
+		SignLink:     signLink,
+		Deadline:     deadline.Format("2 January 2006"),
+		Details:      buildEmailDetails(app),
+		LogoURI:      s.mailer.LogoDataURI(),
+		AppID:        app.ID[:8],
+	})
+	if err != nil {
+		return fmt.Errorf("render esign: %w", err)
+	}
+	subject := fmt.Sprintf("Kontrak %s Siap Ditandatangani - BPR Perdana", productLabel)
+	return s.send(ctx, app.ID, *app.Customer.Email, "esign_link_email", subject, body)
 }
 
 // ── private helper ────────────────────────────────────────────────────────────
@@ -157,20 +215,78 @@ func (s *notificationService) send(
 	return sendErr
 }
 
-func (s *notificationService) SendESignLink(
-	ctx context.Context,
-	appID, toEmail, customerName, productName, signLink string,
-	deadline time.Time,
-) error {
-	body, err := email.RenderHTML(email.TmplESignLink, email.ESignLinkData{
-		CustomerName: customerName,
-		ProductName:  productName,
-		SignLink:     signLink,
-		Deadline:     deadline.Format("2 January 2006"),
-	})
-	if err != nil {
-		return fmt.Errorf("render esign template: %w", err)
+func buildEmailDetails(app *model.Application) []email.EmailDetail {
+	details := []email.EmailDetail{}
+
+	switch {
+	case app.SavingDetail != nil:
+		s := app.SavingDetail
+		details = append(details,
+			email.EmailDetail{"Nama Produk", s.ProductName},
+			email.EmailDetail{"Setoran Awal", formatIDR(s.InitialDeposit)},
+			email.EmailDetail{"Sumber Dana", s.SourceOfFunds},
+			email.EmailDetail{"Tujuan Menabung", s.SavingPurpose},
+		)
+
+	case app.DepositDetail != nil:
+		d := app.DepositDetail
+		details = append(details,
+			email.EmailDetail{"Nama Produk", d.ProductName},
+			email.EmailDetail{"Nominal Penempatan", formatIDR(d.PlacementAmount)},
+			email.EmailDetail{"Tenor", fmt.Sprintf("%d bulan", d.TenorMonths)},
+			email.EmailDetail{"Jenis Rollover", d.RolloverType},
+			email.EmailDetail{"Sumber Dana", d.SourceOfFunds},
+		)
+
+	case app.LoanDetail != nil:
+		l := app.LoanDetail
+		details = append(details,
+			email.EmailDetail{"Nama Produk", l.ProductName},
+			email.EmailDetail{"Plafon Kredit", formatIDR(l.RequestedAmount)},
+			email.EmailDetail{"Tenor", fmt.Sprintf("%d bulan", l.TenorMonths)},
+			email.EmailDetail{"Tujuan Pinjaman", l.LoanPurpose},
+		)
 	}
-	subject := fmt.Sprintf("Kontrak %s Siap Ditandatangani - BPR Perdana", productName)
-	return s.send(ctx, appID, toEmail, "esign_link_email", subject, body)
+
+	// Tambah info rekening pencairan jika ada
+	if app.DisbursementData != nil {
+		d := app.DisbursementData
+		details = append(details,
+			email.EmailDetail{"Bank Pencairan", d.BankName},
+			email.EmailDetail{"No. Rekening", d.AccountNumber},
+			email.EmailDetail{"Atas Nama", d.AccountHolder},
+		)
+	}
+
+	return details
+}
+
+// formatIDR memformat angka ke format Rupiah
+func formatIDR(amount uint64) string {
+	if amount == 0 {
+		return "—"
+	}
+	// Format manual tanpa library eksternal
+	str := fmt.Sprintf("%d", amount)
+	result := ""
+	for i, ch := range str {
+		if i > 0 && (len(str)-i)%3 == 0 {
+			result += "."
+		}
+		result += string(ch)
+	}
+	return "Rp " + result
+}
+
+func productLabel(productType string) string {
+	switch productType {
+	case "SAVING":
+		return "Tabungan"
+	case "DEPOSIT":
+		return "Deposito"
+	case "LOAN":
+		return "Pinjaman"
+	default:
+		return productType
+	}
 }
