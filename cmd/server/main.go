@@ -127,6 +127,17 @@ func main() {
 		cfg.Email.FromEmail,
 	)
 
+	if cfg.Storage.LogoPath != "" {
+		if err := mailer.LoadLogo(cfg.Storage.LogoPath); err != nil {
+			log.Warn("Email logo not loaded — emails will be sent without logo",
+				zap.String("path", cfg.Storage.LogoPath),
+				zap.Error(err),
+			)
+		} else {
+			log.Info("Email logo loaded", zap.String("path", cfg.Storage.LogoPath))
+		}
+	}
+
 	// STEP 6: Initialize Repositories
 	userRepo := repository.NewUserRepository(db)
 	auditRepo := repository.NewAuditRepository(db)

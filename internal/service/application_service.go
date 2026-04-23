@@ -598,6 +598,36 @@ func (s *applicationService) SaveLivenessResult(ctx context.Context, appID strin
 		}
 	}
 
+	// ── Simpan selfie ke storage ──────────────────────────────────────────────
+	var selfiePath *string
+	if input.SelfieBase64 != "" {
+		rawB64 := input.SelfieBase64
+		// Strip data URI prefix jika ada
+		if idx := strings.Index(rawB64, ","); idx != -1 {
+			rawB64 = rawB64[idx+1:]
+		}
+		selfieBytes, decErr := base64.StdEncoding.DecodeString(rawB64)
+		if decErr != nil {
+			s.log.Warn("Failed to decode selfie base64",
+				zap.String("app_id", appID), zap.Error(decErr))
+		} else {
+			savedPath, saveErr := s.storage.SaveFile(
+				storage.FileTypeSelfie,
+				appID+".jpg",
+				bytes.NewReader(selfieBytes),
+			)
+			if saveErr != nil {
+				s.log.Warn("Failed to save selfie image",
+					zap.String("app_id", appID), zap.Error(saveErr))
+			} else {
+				selfiePath = &savedPath
+				s.log.Info("Selfie image saved",
+					zap.String("path", savedPath),
+					zap.String("app_id", appID))
+			}
+		}
+	}
+
 	// ── Simpan hasil ke database (sama seperti sebelumnya) ───────────────────
 	faceMatchStatus := "NOT_MATCHED"
 	if fraudData.FaceMatch {
@@ -616,6 +646,7 @@ func (s *applicationService) SaveLivenessResult(ctx context.Context, appID strin
 		LivenessScore:   &fraudData.FaceMatchScore,
 		FaceMatchStatus: strPtrIfNotEmpty(faceMatchStatus),
 		FaceMatchScore:  &fraudData.FaceMatchScore,
+		SelfieImagePath: selfiePath,
 		RawResponse: model.JSON{
 			"face_match":       fraudData.FaceMatch,
 			"face_match_score": fraudData.FaceMatchScore,
@@ -733,21 +764,14 @@ func (s *applicationService) Submit(ctx context.Context, appID string) error {
 	}
 
 	go func() {
-		if app.Customer.Email == nil || *app.Customer.Email == "" {
-			return
-		}
-		customerName := "Nasabah"
-		if app.Customer.FullName != nil {
-			customerName = *app.Customer.FullName
-		}
-		productName := string(app.ProductType)
-		if err := s.notifSvc.SendSubmitConfirmation(
-			context.Background(),
-			appID,
-			*app.Customer.Email,
-			customerName,
-			productName,
-		); err != nil {
+		defer func() {
+			if r := recover(); r != nil {
+				s.log.Error("Email goroutine panicked", zap.Any("panic", r))
+			}
+		}()
+		// app sudah di-load dengan FindByIDWithDetails sebelumnya
+		// signature baru pakai *model.Application
+		if err := s.notifSvc.SendSubmitConfirmation(context.Background(), app); err != nil {
 			s.log.Warn("Submit confirmation email failed", zap.Error(err))
 		}
 	}()

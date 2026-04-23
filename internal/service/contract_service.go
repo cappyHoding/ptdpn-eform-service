@@ -243,16 +243,11 @@ func (s *contractService) initiateMockContract(
 	}
 
 	if s.notifSvc != nil {
-		customerName := "Nasabah"
-		if app.Customer.FullName != nil {
-			customerName = *app.Customer.FullName
+		if err := s.notifSvc.SendESignLink(
+			context.Background(), app, mockSignLink, deadline,
+		); err != nil {
+			s.log.Warn("eSign email failed", zap.Error(err))
 		}
-		_ = s.notifSvc.SendESignLink(
-			context.Background(),
-			appID, customerEmail, customerName,
-			string(app.ProductType),
-			mockSignLink, deadline,
-		)
 	}
 
 	s.log.Info("Mock contract initiated",

@@ -5,6 +5,9 @@ import (
 	"net/http"
 	"strconv"
 
+	"path/filepath"
+	"strings"
+
 	"github.com/cappyHoding/ptdpn-eform-service/internal/api/middleware"
 	"github.com/cappyHoding/ptdpn-eform-service/internal/service"
 	"github.com/cappyHoding/ptdpn-eform-service/pkg/response"
@@ -264,6 +267,80 @@ func (h *AdminHandler) ReactivateUser(c *gin.Context) {
 		return
 	}
 	response.OK(c, "User reactivated", nil)
+}
+
+// ServeKTPImage handles GET /api/v1/admin/applications/:id/images/ktp
+// Membaca file KTP dari local storage dan mengembalikan sebagai image.
+func (h *AdminHandler) ServeKTPImage(c *gin.Context) {
+	appID := c.Param("id")
+
+	app, err := h.adminService.GetApplicationDetail(c.Request.Context(), appID)
+	if err != nil {
+		response.NotFound(c, "Application not found")
+		return
+	}
+
+	if app.OCRResult == nil || app.OCRResult.KTPImagePath == "" {
+		response.NotFound(c, "KTP image not available")
+		return
+	}
+
+	filePath := app.OCRResult.KTPImagePath
+
+	// Security check — pastikan path dalam storage directory
+	if !isValidStoragePath(filePath) {
+		response.BadRequest(c, "Invalid file path")
+		return
+	}
+
+	// Deteksi content type dari ekstensi file
+	contentType := "image/jpeg"
+	ext := strings.ToLower(filepath.Ext(filePath))
+	if ext == ".png" {
+		contentType = "image/png"
+	}
+
+	c.Header("Cache-Control", "private, max-age=3600")
+	c.File(filePath)
+	_ = contentType
+}
+
+// ServeSelfieImage handles GET /api/v1/admin/applications/:id/images/selfie
+func (h *AdminHandler) ServeSelfieImage(c *gin.Context) {
+	appID := c.Param("id")
+
+	app, err := h.adminService.GetApplicationDetail(c.Request.Context(), appID)
+	if err != nil {
+		response.NotFound(c, "Application not found")
+		return
+	}
+
+	if app.LivenessResult == nil || app.LivenessResult.SelfieImagePath == nil ||
+		*app.LivenessResult.SelfieImagePath == "" {
+		response.NotFound(c, "Selfie image not available")
+		return
+	}
+
+	filePath := *app.LivenessResult.SelfieImagePath
+
+	if !isValidStoragePath(filePath) {
+		response.BadRequest(c, "Invalid file path")
+		return
+	}
+
+	c.Header("Cache-Control", "private, max-age=3600")
+	c.File(filePath)
+}
+
+// isValidStoragePath memastikan path tidak mengandung directory traversal.
+func isValidStoragePath(path string) bool {
+	if path == "" {
+		return false
+	}
+	cleaned := filepath.Clean(path)
+	// Pastikan tidak ada ".." yang bisa keluar dari storage directory
+	return !strings.Contains(cleaned, "..") && !strings.HasPrefix(cleaned, "/etc") &&
+		!strings.HasPrefix(cleaned, "/proc")
 }
 
 // ─── System Config ────────────────────────────────────────────────────────────

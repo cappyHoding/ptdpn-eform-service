@@ -32,24 +32,28 @@ const (
 func RequireInternalAuth(jwtManager *jwt.Manager) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// Extract "Bearer <token>" from Authorization header
+		tokenString := ""
 		authHeader := c.GetHeader("Authorization")
-		if authHeader == "" {
+		if authHeader != "" {
+			parts := strings.SplitN(authHeader, " ", 2)
+			if len(parts) == 2 && strings.ToLower(parts[0]) == "bearer" {
+				tokenString = parts[1]
+			}
+		}
+
+		// Fallback ke query param ?token= (untuk <img src> tag yang tidak bisa kirim header)
+		if tokenString == "" {
+			tokenString = c.Query("token")
+		}
+
+		// Kalau keduanya kosong, reject
+		if tokenString == "" {
 			response.Unauthorized(c, "Authorization header is required")
 			c.Abort()
 			return
 		}
 
-		// The header must start with "Bearer "
-		parts := strings.SplitN(authHeader, " ", 2)
-		if len(parts) != 2 || strings.ToLower(parts[0]) != "bearer" {
-			response.Unauthorized(c, "Authorization header must be in format: Bearer <token>")
-			c.Abort()
-			return
-		}
-
-		tokenString := parts[1]
-
-		// Verify the token — this checks signature, expiry, and structure
+		// Verify the token — sama seperti sebelumnya
 		claims, err := jwtManager.VerifyAccessToken(tokenString)
 		if err != nil {
 			response.Unauthorized(c, "Invalid or expired token")
@@ -57,13 +61,12 @@ func RequireInternalAuth(jwtManager *jwt.Manager) gin.HandlerFunc {
 			return
 		}
 
-		// Store claims in context so handlers can access them without
-		// re-parsing the token (e.g., to know who is performing an action)
 		c.Set(ContextKeyUserID, claims.UserID)
 		c.Set(ContextKeyUsername, claims.Username)
 		c.Set(ContextKeyRole, claims.Role)
 
 		c.Next()
+
 	}
 }
 

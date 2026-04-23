@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/cappyHoding/ptdpn-eform-service/internal/service"
 	"github.com/cappyHoding/ptdpn-eform-service/pkg/response"
@@ -394,6 +395,95 @@ func (h *ApplicationHandler) SubmitCollateral(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "Collateral data saved"})
+}
+
+// TrackStatus handles GET /api/v1/applications/track?id=APP_ID
+// Public endpoint — tidak perlu session token.
+// Nasabah cek status pengajuan menggunakan application ID dari konfirmasi submit.
+func (h *ApplicationHandler) TrackStatus(c *gin.Context) {
+	appID := c.Query("id")
+	if appID == "" {
+		response.BadRequest(c, "Application ID is required")
+		return
+	}
+
+	// searchID := appID
+	// prefixes := []string{"DEP-", "TAB-", "KRD-"}
+	// for _, p := range prefixes {
+	// 	if strings.HasPrefix(strings.ToUpper(appID), p) {
+	// 		searchID = appID[len(p):]
+	// 		break
+	// 	}
+	// }
+
+	app, err := h.appService.GetApplicationWithDetails(c.Request.Context(), appID)
+	if err != nil {
+		if errors.Is(err, service.ErrApplicationNotFound) {
+			response.NotFound(c, "Pengajuan tidak ditemukan. Pastikan ID pengajuan sudah benar.")
+			return
+		}
+		response.InternalError(c, "")
+		return
+	}
+
+	statusMessages := map[string]string{
+		"DRAFT":          "Pengajuan Anda belum selesai diisi.",
+		"PENDING_REVIEW": "Pengajuan Anda telah diterima dan sedang menunggu review oleh tim kami.",
+		"IN_REVIEW":      "Pengajuan Anda sedang dalam proses review oleh tim kami.",
+		"RECOMMENDED":    "Pengajuan Anda sedang dalam proses persetujuan akhir.",
+		"APPROVED":       "Selamat! Pengajuan Anda telah disetujui. Silakan cek email Anda.",
+		"REJECTED":       "Mohon maaf, pengajuan Anda tidak dapat diproses. Hubungi CS kami.",
+		"SIGNING":        "Silakan tandatangani kontrak melalui link yang telah dikirim ke email Anda.",
+		"COMPLETED":      "Proses pengajuan Anda telah selesai. Selamat bergabung dengan BPR Perdana!",
+		"EXPIRED":        "Masa berlaku pengajuan Anda telah habis. Silakan hubungi CS kami.",
+	}
+
+	statusLabels := map[string]string{
+		"DRAFT": "Draft", "PENDING_REVIEW": "Menunggu Review",
+		"IN_REVIEW": "Dalam Review", "RECOMMENDED": "Direkomendasikan",
+		"APPROVED": "Disetujui", "REJECTED": "Ditolak",
+		"SIGNING": "Menunggu Tanda Tangan", "COMPLETED": "Selesai",
+		"EXPIRED": "Kedaluwarsa",
+	}
+
+	// ── Customer name — Customer adalah value type, cek via pointer field ──────
+	customerName := ""
+	if app.Customer.FullName != nil { // ← langsung akses field, BUKAN cek app.Customer != nil
+		name := *app.Customer.FullName
+		if len(name) > 3 {
+			customerName = name[:3] + strings.Repeat("*", len(name)-3)
+		} else {
+			customerName = name
+		}
+	}
+
+	var submittedAt *string
+	if app.SubmittedAt != nil {
+		t := app.SubmittedAt.Format("02 Jan 2006 15:04")
+		submittedAt = &t
+	}
+
+	type statusResponse struct {
+		ApplicationID string  `json:"application_id"`
+		Status        string  `json:"status"`
+		StatusLabel   string  `json:"status_label"`
+		ProductType   string  `json:"product_type"`
+		CustomerName  string  `json:"customer_name,omitempty"`
+		SubmittedAt   *string `json:"submitted_at,omitempty"`
+		UpdatedAt     string  `json:"updated_at"`
+		Message       string  `json:"message"`
+	}
+
+	response.OK(c, "Status retrieved", statusResponse{
+		ApplicationID: app.ID,
+		Status:        string(app.Status),
+		StatusLabel:   statusLabels[string(app.Status)],
+		ProductType:   string(app.ProductType),
+		CustomerName:  customerName,
+		SubmittedAt:   submittedAt,
+		UpdatedAt:     app.UpdatedAt.Format("02 Jan 2006 15:04"),
+		Message:       statusMessages[string(app.Status)],
+	})
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
