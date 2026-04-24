@@ -134,7 +134,11 @@ func main() {
 				zap.Error(err),
 			)
 		} else {
-			log.Info("Email logo loaded", zap.String("path", cfg.Storage.LogoPath))
+			// log.Info("Email logo loaded", zap.String("path", cfg.Storage.LogoPath))
+			log.Info("Email logo debug",
+				zap.String("path", cfg.Storage.LogoPath),
+				zap.Int("data_uri_length", len(mailer.LogoDataURI())), // kalau 0 = gagal
+			)
 		}
 	}
 
