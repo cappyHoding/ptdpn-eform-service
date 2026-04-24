@@ -87,6 +87,7 @@ func (s *notificationService) SendRejectionNotice(
 		Reason:       reason,
 		Details:      buildEmailDetails(app),
 		LogoURI:      s.mailer.LogoDataURI(),
+		AppID:        app.ID[:8],
 	})
 	if err != nil {
 		return fmt.Errorf("render rejection: %w", err)
@@ -114,6 +115,7 @@ func (s *notificationService) SendApprovalNotice(
 		ProductName:  productLabel,
 		Details:      buildEmailDetails(app),
 		LogoURI:      s.mailer.LogoDataURI(),
+		AppID:        app.ID[:8],
 	})
 
 	if err != nil {

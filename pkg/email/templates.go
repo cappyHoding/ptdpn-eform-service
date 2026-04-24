@@ -18,6 +18,7 @@ type ApprovalData struct {
 	ProductName  string
 	Details      []EmailDetail
 	LogoURI      string
+	AppID        string
 }
 
 type RejectionData struct {
@@ -26,6 +27,7 @@ type RejectionData struct {
 	Reason       string
 	Details      []EmailDetail
 	LogoURI      string
+	AppID        string
 }
 
 type ESignLinkData struct {
