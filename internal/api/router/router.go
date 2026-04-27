@@ -17,6 +17,7 @@ package router
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/cappyHoding/ptdpn-eform-service/config"
 	"github.com/cappyHoding/ptdpn-eform-service/internal/api/handler"
@@ -27,6 +28,7 @@ import (
 	"github.com/gin-contrib/cors"
 	"github.com/gin-contrib/requestid"
 	"github.com/gin-gonic/gin"
+	"github.com/redis/go-redis/v9"
 )
 
 // Dependencies groups all handler dependencies for clean injection.
@@ -36,6 +38,7 @@ type Dependencies struct {
 	JWT      *jwt.Manager
 	Handlers *handler.Registry
 	AppRepo  repository.ApplicationRepository
+	Redis    *redis.Client
 }
 
 // Setup creates and configures the Gin router with all routes and middleware.
@@ -71,6 +74,20 @@ func Setup(deps Dependencies) *gin.Engine {
 	// 4. Request logger — logs every request after CORS
 	router.Use(middleware.RequestLogger(deps.Logger))
 
+	//5. Global Rate Limiter - semua request di limit per IP untuk mencegah abuse dan DDoS
+	// aktif hanya jika redis tersedia
+	var (
+		globalLimiter    *middleware.RateLimiter
+		sensitiveLimiter *middleware.RateLimiter
+		adminLimiter     *middleware.RateLimiter
+	)
+
+	if deps.Redis != nil {
+		globalLimiter = middleware.NewRateLimiter(deps.Redis, 60, time.Minute, "rl:global:")
+		sensitiveLimiter = middleware.NewRateLimiter(deps.Redis, 10, time.Minute, "rl:sensitive:")
+		adminLimiter = middleware.NewRateLimiter(deps.Redis, 120, time.Minute, "rl:admin:")
+	}
+
 	// ── Health Check ──────────────────────────────────────────────────────────
 	// Simple endpoint for load balancers and monitoring to verify the server is up
 	router.GET("/health", func(c *gin.Context) {
@@ -84,10 +101,10 @@ func Setup(deps Dependencies) *gin.Engine {
 	v1 := router.Group("/api/v1")
 
 	// ── Customer-Facing Routes (no login, session-token auth after Step 2) ───
-	setupCustomerRoutes(v1, deps)
+	setupCustomerRoutes(v1, deps, globalLimiter, sensitiveLimiter)
 
 	// ── Internal Admin Routes (JWT auth required) ─────────────────────────────
-	setupAdminRoutes(v1, deps)
+	setupAdminRoutes(v1, deps, adminLimiter)
 
 	// ── Webhook Routes ────────────────────────────────────────────────────────
 	setupWebhookRoutes(router, deps)
@@ -96,28 +113,50 @@ func Setup(deps Dependencies) *gin.Engine {
 }
 
 // setupCustomerRoutes configures all public/customer-facing endpoints.
-func setupCustomerRoutes(v1 *gin.RouterGroup, deps Dependencies) {
+func setupCustomerRoutes(
+	v1 *gin.RouterGroup,
+	deps Dependencies,
+	globalLimiter *middleware.RateLimiter,
+	sensitive *middleware.RateLimiter,
+) {
 	apps := v1.Group("/applications")
+
+	// Global rate limit untuk semua customer endpoint
+	if globalLimiter != nil {
+		apps.Use(globalLimiter.Limit())
+	}
+
 	h := deps.Handlers
 
-	// Step 1 — Agreement (no auth)
-	apps.POST("/agree", h.Application.AcceptAgreement)
+	// Step 1 — Agreement: sensitive karena buat session baru
+	agree := apps.Group("/agree")
+	if sensitive != nil {
+		agree.Use(sensitive.Limit())
+	}
+	agree.POST("", h.Application.AcceptAgreement)
 
-	// Step 2 — Create application (no auth, returns session token)
+	// Step 2 — Create application
 	apps.POST("", h.Application.Create)
 
+	// Public tracking
 	apps.GET("/track", h.Application.TrackStatus)
 
-	// Steps 3-7 — Require valid X-Session-Token header
-	// The session middleware validates the token and binds it to the application ID
+	// Steps 3-7 — Require session
 	sessionRequired := apps.Group("")
 	sessionRequired.Use(middleware.RequireCustomerSession(deps.AppRepo))
 	{
 		sessionRequired.GET("/:id", h.Application.GetByID)
-		sessionRequired.POST("/:id/ocr", h.Application.SubmitOCR)                     // Step 3
+
+		// OCR dan Liveness: paling mahal — rate limit ketat
+		ocrGroup := sessionRequired.Group("")
+		if sensitive != nil {
+			ocrGroup.Use(sensitive.Limit())
+		}
+		ocrGroup.POST("/:id/ocr", h.Application.SubmitOCR)           // Step 3
+		ocrGroup.POST("/:id/liveness", h.Application.SubmitLiveness) // Step 5
+
 		sessionRequired.PATCH("/:id/personal-info", h.Application.UpdatePersonalInfo) // Step 4
 		sessionRequired.GET("/:id/liveness/token", h.Application.GetLivenessToken)
-		sessionRequired.POST("/:id/liveness", h.Application.SubmitLiveness)          // Step 5
 		sessionRequired.PATCH("/:id/disbursement", h.Application.UpdateDisbursement) // Step 6
 		sessionRequired.PATCH("/:id/collateral", h.Application.SubmitCollateral)
 		sessionRequired.POST("/:id/submit", h.Application.Submit) // Step 7
@@ -125,8 +164,13 @@ func setupCustomerRoutes(v1 *gin.RouterGroup, deps Dependencies) {
 }
 
 // setupAdminRoutes configures all internal staff endpoints.
-func setupAdminRoutes(v1 *gin.RouterGroup, deps Dependencies) {
+func setupAdminRoutes(v1 *gin.RouterGroup, deps Dependencies, adminLimiter *middleware.RateLimiter) {
 	admin := v1.Group("/admin")
+
+	// Rate limit admin endpoints
+	if adminLimiter != nil {
+		admin.Use(adminLimiter.Limit())
+	}
 
 	// Auth endpoints — no JWT required (you need to login first!)
 	auth := admin.Group("/auth")

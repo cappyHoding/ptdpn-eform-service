@@ -178,6 +178,7 @@ func main() {
 		JWT:      jwtManager,
 		Handlers: handlers,
 		AppRepo:  appRepo,
+		Redis:    redisClient,
 	})
 
 	// ── STEP 8: Start HTTP Server with Graceful Shutdown ─────────────────────
