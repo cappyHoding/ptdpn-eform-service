@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/cappyHoding/ptdpn-eform-service/config"
@@ -114,15 +115,22 @@ func (s *contractService) InitiateContract(ctx context.Context, appID string, ac
 
 	// 3. Generate PDF kontrak
 	s.log.Info("Generating contract PDF", zap.String("app_id", appID))
-	pdfBytes, err := contractpdf.GenerateContract(buildContractData(app, s.logoPath))
+	result, err := contractpdf.GenerateContract(buildContractData(app, s.logoPath))
 	if err != nil {
 		return fmt.Errorf("PDF generation failed: %w", err)
 	}
 
+	s.log.Info("Contract PDF generated",
+		zap.Int("total_pages", result.TotalPages),
+		zap.Int("sig_page", result.SignaturePosition.PageIndex),
+		zap.Int("sig_x", result.SignaturePosition.X),
+		zap.Int("sig_y", result.SignaturePosition.Y),
+	)
+
 	pdfPath, err := s.storage.SaveFile(
 		storage.FileTypeContract,
 		appID+".pdf",
-		bytes.NewReader(pdfBytes),
+		bytes.NewReader(result.PDFBytes),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to save contract PDF: %w", err)
@@ -130,54 +138,73 @@ func (s *contractService) InitiateContract(ctx context.Context, appID string, ac
 	s.log.Info("Contract PDF saved", zap.String("path", pdfPath))
 
 	// 4. Apply eMeterai (best-effort — tidak block jika gagal)
-	var materaiID *string
-	var materaiAppliedAt *time.Time
+	// var materaiID *string
+	// var materaiAppliedAt *time.Time
 
-	stampCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-	defer cancel()
+	// stampCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	// defer cancel()
 
-	stampResult, stampErr := s.vida.EMeterai.ApplyStamp(stampCtx, pdfPath, appID)
-	if stampErr != nil {
-		s.log.Warn("eMeterai failed, proceeding without stamp",
-			zap.String("app_id", appID), zap.Error(stampErr))
-	} else if stampResult != nil && stampResult.StampedDoc != "" {
-		stampedBytes, decErr := base64.StdEncoding.DecodeString(stampResult.StampedDoc)
-		if decErr == nil {
-			if stamppedPath, saveErr := s.storage.SaveFile(
-				storage.FileTypeContract, appID+".pdf",
-				bytes.NewReader(stampedBytes),
-			); saveErr == nil {
-				pdfPath = stamppedPath
-				now := time.Now()
-				materaiAppliedAt = &now
-				mid := stampResult.MateraiID
-				materaiID = &mid
-				s.log.Info("eMeterai applied", zap.String("serial", stampResult.SerialNumber))
-			}
-		}
-	}
+	// stampResult, stampErr := s.vida.EMeterai.ApplyStamp(stampCtx, pdfPath, appID)
+	// if stampErr != nil {
+	// 	s.log.Warn("eMeterai failed, proceeding without stamp",
+	// 		zap.String("app_id", appID), zap.Error(stampErr))
+	// } else if stampResult != nil && stampResult.StampedDoc != "" {
+	// 	stampedBytes, decErr := base64.StdEncoding.DecodeString(stampResult.StampedDoc)
+	// 	if decErr == nil {
+	// 		if stamppedPath, saveErr := s.storage.SaveFile(
+	// 			storage.FileTypeContract, appID+".pdf",
+	// 			bytes.NewReader(stampedBytes),
+	// 		); saveErr == nil {
+	// 			pdfPath = stamppedPath
+	// 			now := time.Now()
+	// 			materaiAppliedAt = &now
+	// 			mid := stampResult.MateraiID
+	// 			materaiID = &mid
+	// 			s.log.Info("eMeterai applied", zap.String("serial", stampResult.SerialNumber))
+	// 		}
+	// 	}
+	// }
 
 	// 5. Register eSign
-	signTrxID, err := s.vida.Sign.RegisterDocument(
-		ctx,
-		pdfPath,
-		customerEmail,
-		fmt.Sprintf("Kontrak_%s.pdf", appID[:8]),
-		s.serverIP,
-		"BPR-Perdana-Backend/1.0",
-	)
-	if err != nil {
-		return fmt.Errorf("eSign registration failed: %w", err)
+	if s.vida.DirectSign == nil {
+		return fmt.Errorf("Direct Sign service not initialized — set VIDA_DSIGN credentials")
 	}
-	s.log.Info("eSign registered",
-		zap.String("app_id", appID),
-		zap.String("sign_trx_id", signTrxID),
-	)
+
+	customerName := "Nasabah"
+	if app.Customer.FullName != nil {
+		customerName = *app.Customer.FullName
+	}
+
+	customerPhone := ""
+	if app.Customer.PhoneNumber != nil {
+		customerPhone = normalizePhone(*app.Customer.PhoneNumber)
+	}
+	_ = customerPhone
+	sigPos := result.SignaturePosition
+
+	sigResult, err := s.vida.DirectSign.CreateAndStartEnvelope(ctx, vida.CreateEnvelopeInput{
+		PDFPath:        pdfPath,
+		EnvelopeName:   fmt.Sprintf("Kontrak %s - %s", productLabel(string(app.ProductType)), customerName),
+		RecipientName:  customerName,
+		RecipientEmail: customerEmail,
+		KYCEventID:     getKYCEventID(app), // dari liveness_results.vida_request_id
+		ExpirationDays: 7,
+		SignX:          sigPos.X,
+		SignY:          sigPos.Y,
+		SignWidth:      sigPos.Width,
+		SignHeight:     sigPos.Height,
+		SignPageIndex:  sigPos.PageIndex,
+	})
+	if err != nil {
+		return fmt.Errorf("direct sign envelope failed: %w", err)
+	}
 
 	// 6. Simpan contract document ke DB
-	fileSize := uint32(len(pdfBytes))
+	fileSize := uint32(len(result.PDFBytes))
 	now := time.Now()
 	deadline := now.Add(7 * 24 * time.Hour)
+	envelopeID := sigResult.EnvelopeID
+	signingURL := sigResult.SignatureLink
 
 	doc := &model.ContractDocument{
 		ID:                uuid.New().String(),
@@ -185,10 +212,12 @@ func (s *contractService) InitiateContract(ctx context.Context, appID string, ac
 		DocumentType:      string(app.ProductType),
 		FilePath:          pdfPath,
 		FileSizeBytes:     &fileSize,
-		VidaSignRequestID: &signTrxID,
-		EMateraiID:        materaiID,
-		EMateraiAppliedAt: materaiAppliedAt,
-		SignStatus:        "PENDING",
+		VidaSignRequestID: &envelopeID, // ← envelope_id dari Direct Sign
+		EMateraiID:        nil,
+		EMateraiAppliedAt: nil,
+		SignStatus:        "SIGNING",
+		SignLink:          &signingURL, // ← link TTD untuk nasabah
+		SignLinkSentAt:    &now,
 		SignDeadline:      &deadline,
 		GeneratedAt:       now,
 	}
@@ -201,14 +230,25 @@ func (s *contractService) InitiateContract(ctx context.Context, appID string, ac
 		return fmt.Errorf("failed to update status to SIGNING: %w", err)
 	}
 
+	if s.notifSvc != nil {
+		if err := s.notifSvc.SendESignLink(context.Background(), app, signingURL, deadline); err != nil {
+			s.log.Warn("eSign email failed", zap.Error(err))
+		}
+	}
+
 	s.writeAudit(ctx, &model.AuditLog{
-		ActorType:   "internal_user",
-		ActorID:     &actorID,
-		Action:      "CONTRACT_INITIATED",
-		EntityType:  strPtrIfNotEmpty("application"),
-		EntityID:    strPtrIfNotEmpty(appID),
-		Description: strPtrIfNotEmpty("Contract PDF generated, eMeterai applied, eSign link sent to " + customerEmail),
-		NewValue:    model.JSON{"status": "SIGNING", "sign_trx_id": signTrxID},
+		ActorType:  "internal_user",
+		ActorID:    &actorID,
+		Action:     "CONTRACT_INITIATED",
+		EntityType: strPtrIfNotEmpty("application"),
+		EntityID:   strPtrIfNotEmpty(appID),
+		Description: strPtrIfNotEmpty(fmt.Sprintf(
+			"Direct Sign envelope created, link sent to %s", customerEmail,
+		)),
+		NewValue: model.JSON{
+			"status":      "SIGNING",
+			"envelope_id": envelopeID,
+		},
 	})
 
 	return nil
@@ -272,10 +312,12 @@ func (s *contractService) initiateMockContract(
 func (s *contractService) CompleteContract(ctx context.Context, vidaTransactionID string, signedPDFBase64 string) error {
 	doc, err := s.contractRepo.FindContractBySignTrxID(ctx, vidaTransactionID)
 	if err != nil {
-		return fmt.Errorf("contract not found for trx %s: %w", vidaTransactionID, err)
+		return fmt.Errorf("contract not found for envelope_id %s: %w", vidaTransactionID, err)
 	}
 
-	// Simpan signed PDF jika ada dalam payload webhook
+	now := time.Now()
+
+	// Simpan signed PDF jika ada (PoA mengirim via webhook, Direct Sign tidak)
 	if signedPDFBase64 != "" {
 		if signedBytes, decErr := base64.StdEncoding.DecodeString(signedPDFBase64); decErr == nil {
 			signedPath, saveErr := s.storage.SaveFile(
@@ -288,16 +330,17 @@ func (s *contractService) CompleteContract(ctx context.Context, vidaTransactionI
 			}
 		}
 	}
+	// Catatan: untuk Direct Sign, signed PDF bisa didownload via
+	// DirectSign.DownloadSignedDocument() — bisa ditambahkan di sini nanti
 
-	now := time.Now()
 	doc.SignStatus = "COMPLETED"
 	doc.SignedAt = &now
 
 	if err := s.contractRepo.UpdateContract(ctx, doc); err != nil {
-		return fmt.Errorf("failed to update contract: %w", err)
+		return fmt.Errorf("update contract failed: %w", err)
 	}
 	if err := s.appRepo.UpdateStatus(ctx, doc.ApplicationID, model.StatusCompleted); err != nil {
-		return fmt.Errorf("failed to update application status: %w", err)
+		return fmt.Errorf("update app status failed: %w", err)
 	}
 
 	s.writeAudit(ctx, &model.AuditLog{
@@ -305,13 +348,13 @@ func (s *contractService) CompleteContract(ctx context.Context, vidaTransactionI
 		Action:      "CONTRACT_SIGNED",
 		EntityType:  strPtrIfNotEmpty("application"),
 		EntityID:    strPtrIfNotEmpty(doc.ApplicationID),
-		Description: strPtrIfNotEmpty("Customer signed contract via VIDA eSign"),
-		NewValue:    model.JSON{"status": "COMPLETED", "signed_at": now.Format(time.RFC3339)},
+		Description: strPtrIfNotEmpty("Customer signed contract via VIDA Direct Sign"),
+		NewValue:    model.JSON{"status": "COMPLETED", "envelope_id": vidaTransactionID},
 	})
 
 	s.log.Info("Contract COMPLETED",
 		zap.String("app_id", doc.ApplicationID),
-		zap.String("sign_trx_id", vidaTransactionID),
+		zap.String("envelope_id", vidaTransactionID),
 	)
 	return nil
 }
@@ -447,4 +490,28 @@ func derefUint64(u *uint64) uint64 {
 		return 0
 	}
 	return *u
+}
+
+func getKYCEventID(app *model.Application) string {
+	if app.LivenessResult != nil && app.LivenessResult.VidaRequestID != "" {
+		kycID := app.LivenessResult.VidaRequestID
+		// Log untuk verifikasi — apakah ini real VIDA ID atau fallback appID
+		isRealID := kycID != app.ID
+		if !isRealID {
+			// Warning: masih pakai appID sebagai fallback
+			// Ini normal untuk mock liveness, tapi tidak untuk production
+		}
+		return kycID
+	}
+	return ""
+}
+
+func normalizePhone(phone string) string {
+	if strings.HasPrefix(phone, "0") {
+		return "62" + phone[1:]
+	}
+	if strings.HasPrefix(phone, "+62") {
+		return phone[1:]
+	}
+	return phone
 }

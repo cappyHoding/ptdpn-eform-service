@@ -47,11 +47,11 @@ func (s *FraudService) VerifyIdentity(
 	if isSandbox {
 		s.logger.Info("Using VIDA sandbox mock data for fraud assessment",
 			zap.String("original_nik", nik),
-			zap.String("mock_nik", "3511000101806300"),
+			zap.String("mock_nik", "3512001305908001"),
 		)
-		nik = "3511000101806300"
-		fullName = "UserGDAA"
-		dob = "1980-01-01"
+		nik = "3512001305908001"
+		fullName = "UserIAABBBBBB"
+		dob = "1990-06-13"
 	}
 
 	// Tangkap response mentah untuk ekstrak assessmentResults

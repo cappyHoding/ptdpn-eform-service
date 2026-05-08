@@ -124,16 +124,25 @@ type StorageConfig struct {
 
 // VidaConfig groups all VIDA service configurations.
 type VidaConfig struct {
-	OCR      VidaServiceConfig // OCR + Fraud Mitigation (same credential)
-	Sign     VidaSignConfig
-	EMaterai VidaeMateraiConfig
-	WebSDK   VidaWebSDKConfig
+	OCR        VidaServiceConfig // OCR + Fraud Mitigation (same credential)
+	Sign       VidaSignConfig
+	EMaterai   VidaeMateraiConfig
+	WebSDK     VidaWebSDKConfig
+	DirectSign DirectSignConfig
 
 	SigningKey    string
 	WebhookSecret string        // VIDA_WEBHOOK_SECRET
 	HTTPTimeout   time.Duration // VIDA_HTTP_TIMEOUT
 	MockFraud     bool
 	MockContract  bool // VIDA_FRAUD_MOCK — jika true, bypass panggilan Fraud Mitigation dan kembalikan hasil mock
+}
+
+// DirectSignConfig holds credentials for VIDA Direct Sign Platform API.
+type DirectSignConfig struct {
+	BaseURL      string // VIDA_DSIGN_BASE_URL
+	ClientID     string // VIDA_DSIGN_CLIENT_ID
+	SecretKey    string // VIDA_DSIGN_SECRET_KEY
+	CreatorEmail string // VIDA_DSIGN_CREATOR_EMAIL — email member workspace VIDA
 }
 
 // VidaServiceConfig adalah credential untuk OCR dan Fraud Mitigation API.
@@ -316,6 +325,12 @@ func Load() (*Config, error) {
 		WebSDK: VidaWebSDKConfig{ // ← TAMBAHKAN INI
 			ClientID:  v.GetString("VIDA_WEB_SDK_CLIENT_ID"),
 			SecretKey: v.GetString("VIDA_WEB_SDK_CLIENT_SECRET"),
+		},
+		DirectSign: DirectSignConfig{
+			BaseURL:      v.GetString("VIDA_DSIGN_BASE_URL"),
+			ClientID:     v.GetString("VIDA_DSIGN_CLIENT_ID"),
+			SecretKey:    v.GetString("VIDA_DSIGN_SECRET_KEY"),
+			CreatorEmail: v.GetString("VIDA_DSIGN_CREATOR_EMAIL"),
 		},
 		SigningKey:    v.GetString("VIDA_SIGNING_KEY"),
 		WebhookSecret: v.GetString("VIDA_WEBHOOK_SECRET"),

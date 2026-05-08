@@ -317,3 +317,33 @@ func (c *Client) GetTokenWithCredentials(ctx context.Context, clientID, clientSe
 	expAt := time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second).Unix()
 	return tokenResp.AccessToken, expAt, tokenResp.ExpiresIn, nil
 }
+
+// DoMultipartPost melakukan HTTP POST dengan multipart/form-data body.
+// Dipakai oleh DirectSignService untuk upload PDF ke VIDA envelope endpoint.
+// Authorization header di-inject otomatis dari cached token.
+func (c *Client) DoMultipartPost(ctx context.Context, path string, body *bytes.Buffer, contentType string) ([]byte, int, error) {
+	token, err := c.getAccessToken(ctx)
+	if err != nil {
+		return nil, 0, fmt.Errorf("get access token: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, body)
+	if err != nil {
+		return nil, 0, fmt.Errorf("create multipart request: %w", err)
+	}
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, 0, fmt.Errorf("multipart POST %s failed: %w", path, err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, resp.StatusCode, fmt.Errorf("read response: %w", err)
+	}
+
+	return respBody, resp.StatusCode, nil
+}

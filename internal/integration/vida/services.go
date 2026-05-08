@@ -23,10 +23,11 @@ import (
 //	vida.Sign.RegisterDocument(ctx, pdfPath, email, filename, srcIP, ua)
 //	vida.EMeterai.ApplyStamp(ctx, pdfPath, refNum)
 type Services struct {
-	OCR      *OCRService
-	Fraud    *FraudService
-	Sign     *SignService
-	EMeterai *eMateraiService
+	OCR        *OCRService
+	Fraud      *FraudService
+	Sign       *SignService
+	EMeterai   *eMateraiService
+	DirectSign *DirectSignService
 }
 
 // NewServices membuat semua VIDA service dari konfigurasi.
@@ -58,6 +59,21 @@ func NewServices(cfg *config.Config) *Services {
 		"roles",
 		timeout,
 	)
+
+	const dsignSSO = "https://qa-sso.vida.id/auth/realms/vida/protocol/openid-connect/token"
+	var directSignSvc *DirectSignService
+
+	if cfg.Vida.DirectSign.ClientID != "" {
+		dsignClient := NewClient(
+			cfg.Vida.DirectSign.BaseURL, 
+			dsignSSO,
+			cfg.Vida.DirectSign.ClientID,
+			cfg.Vida.DirectSign.SecretKey,
+			"roles",
+			timeout,
+		)
+		directSignSvc = NewDirectSignService(dsignClient, cfg.Vida.DirectSign.CreatorEmail)
+	}
 
 	// ── eMeterai: SSO dan base URL berbeda ────────────────────────────────────
 	const eMateraiSSO = "https://qa-sso-26.np.vida.id/auth/realms/vida/protocol/openid-connect/token"
@@ -95,6 +111,7 @@ func NewServices(cfg *config.Config) *Services {
 			cfg.Vida.Sign.APIKey,       // 16 chars — IV untuk enkripsi CVV
 			cfg.Vida.Sign.KeyID,        // POA ID dari email VIDA
 		),
-		EMeterai: NeweMateraiService(eMateraiClient, cfg.Vida.EMaterai.PartnerID),
+		EMeterai:   NeweMateraiService(eMateraiClient, cfg.Vida.EMaterai.PartnerID),
+		DirectSign: directSignSvc,
 	}
 }

@@ -122,10 +122,25 @@ type LoanData struct {
 	SourceOfFunds   string
 }
 
+type SignaturePosition struct {
+	PageIndex int // halaman terakhir (1-based)
+	X         int // dalam points (VIDA coordinate)
+	Y         int // dalam points dari atas halaman
+	Width     int // dalam points
+	Height    int // dalam points
+}
+
+// ContractResult berisi PDF bytes + metadata posisi TTD
+type ContractResult struct {
+	PDFBytes          []byte
+	SignaturePosition SignaturePosition
+	TotalPages        int
+}
+
 // ─── Generator ────────────────────────────────────────────────────────────────
 
 // GenerateContract membuat PDF kontrak dan mengembalikan bytes-nya.
-func GenerateContract(data ContractData) ([]byte, error) {
+func GenerateContract(data ContractData) (*ContractResult, error) {
 	g := &generator{
 		pdf:  gofpdf.New("P", "mm", "A4", ""),
 		data: data,
@@ -138,14 +153,25 @@ type generator struct {
 	data ContractData
 }
 
-func (g *generator) build() ([]byte, error) {
+func (g *generator) build() (*ContractResult, error) {
 	pdf := g.pdf
 	pdf.SetMargins(marginL, marginT, marginR)
 	pdf.SetAutoPageBreak(true, marginB)
-	pdf.AddPage()
 
-	// Page decorations (stripe top + bottom + border)
-	g.drawPageBorder()
+	// ── PDF Metadata ──────────────────────────────────────────────────────────
+	pdf.SetTitle(g.docTitle(), true)
+	pdf.SetAuthor(companyFull, true)
+	pdf.SetSubject("Perjanjian Pembukaan Rekening BPR Perdana", true)
+	pdf.SetCreator("BPR Perdana eForm System v1.0", true)
+	pdf.SetCreationDate(time.Now())
+
+	// ── Auto header di setiap halaman ─────────────────────────────────────────
+	pdf.SetHeaderFuncMode(func() {
+		g.drawPageBorder()
+	}, true)
+
+	// ── Halaman pertama ───────────────────────────────────────────────────────
+	pdf.AddPage() // trigger SetHeaderFuncMode → drawPageBorder otomatis
 
 	// ── Header ────────────────────────────────────────────────────────────────
 	g.drawHeader()
@@ -162,7 +188,6 @@ func (g *generator) build() ([]byte, error) {
 	pdf.CellFormat(contentW, 5.5, "Nomor: "+docNo, "", 1, "C", false, 0, "")
 	pdf.CellFormat(contentW, 5.5, "Tanggal: "+g.dateID(g.data.ApprovedAt), "", 1, "C", false, 0, "")
 
-	// Thin divider
 	g.setDrawColor(colMGray)
 	pdf.SetLineWidth(0.3)
 	pdf.Line(marginL, pdf.GetY()+1.5, pageW-marginR, pdf.GetY()+1.5)
@@ -183,29 +208,26 @@ func (g *generator) build() ([]byte, error) {
 	}
 
 	pdf.Ln(3)
-	// Cek ruang untuk minimal 3 klausa + header (~40mm)
 	if pageH-marginB-marginT-pdf.GetY() < 40 {
-		pdf.AddPage()
-		g.drawPageBorder()
+		pdf.AddPage() // drawPageBorder otomatis via SetHeaderFuncMode
 	}
 	g.sectionHeader("PERNYATAAN DAN PERSETUJUAN")
 	pdf.Ln(2)
 	g.drawClauses()
 
 	pdf.Ln(5)
-	// Cek apakah cukup ruang untuk signature section (~55mm)
-	// Jika tidak cukup, pindah ke halaman baru
 	remainingSpace := pageH - marginB - marginT - pdf.GetY()
 	if remainingSpace < 55 {
-		pdf.AddPage()
-		g.drawPageBorder()
+		pdf.AddPage() // drawPageBorder otomatis via SetHeaderFuncMode
 	}
+	sigPageIndex := pdf.PageNo()
+
 	g.sectionHeader("PENANDATANGANAN")
 	pdf.Ln(3)
+	startY := pdf.GetY() + 8 + 3
 	g.drawSignature()
 
 	pdf.Ln(4)
-	// Footer divider
 	g.setDrawColor(colMGray)
 	pdf.SetLineWidth(0.3)
 	pdf.Line(marginL, pdf.GetY(), pageW-marginR, pdf.GetY())
@@ -225,7 +247,30 @@ func (g *generator) build() ([]byte, error) {
 	if err := pdf.Output(&buf); err != nil {
 		return nil, fmt.Errorf("pdf output failed: %w", err)
 	}
-	return buf.Bytes(), nil
+
+	mmToPoints := func(mm float64) int {
+		return int(mm * 2.835)
+	}
+
+	sigColW := 80.0
+	sigX := marginL + (contentW-sigColW)/2 // 65mm dari kiri
+
+	// Y posisi kotak TTD dari atas halaman:
+	// startY adalah Y setelah header "PENANDATANGANAN" + Ln(3)
+	// Kotak TTD ada setelah row header (8mm)
+	sigY := startY + 8 // +8 untuk header row
+
+	return &ContractResult{
+		PDFBytes:   buf.Bytes(),
+		TotalPages: pdf.PageNo(),
+		SignaturePosition: SignaturePosition{
+			PageIndex: sigPageIndex,
+			X:         mmToPoints(sigX),
+			Y:         mmToPoints(sigY),
+			Width:     mmToPoints(sigColW),
+			Height:    mmToPoints(30), // tinggi kotak TTD 30mm
+		},
+	}, nil
 }
 
 // ─── Page decoration ──────────────────────────────────────────────────────────
@@ -246,13 +291,16 @@ func (g *generator) drawPageBorder() {
 	pdf.SetLineWidth(0.4)
 	pdf.Rect(10, 8, pageW-20, pageH-16, "D")
 
-	// Page number (in yellow stripe area)
+	// Page number — gunakan PageNo() bukan PageCount()
+	// PageNo() mengembalikan nomor halaman saat ini (1-based setelah AddPage)
 	g.setFont("", 7)
 	g.setTextColor(colDGray)
 	pdf.SetXY(0, pageH-3.5)
-	pdf.CellFormat(pageW, 3, fmt.Sprintf("Halaman %d", pdf.PageCount()), "", 0, "C", false, 0, "")
+	pdf.CellFormat(pageW, 3,
+		fmt.Sprintf("Halaman %d", pdf.PageNo()), // ← ganti PageCount() → PageNo()
+		"", 0, "C", false, 0, "")
 
-	// Reset cursor to content area
+	// Reset cursor ke content area
 	pdf.SetXY(marginL, marginT)
 }
 
@@ -389,47 +437,35 @@ func (g *generator) drawClauses() {
 
 func (g *generator) drawSignature() {
 	pdf := g.pdf
-	colW := contentW / 3
 
-	headers := []string{"Nasabah", "Tanggal Penandatanganan", "PT BPR Daya Perdana Nusantara"}
-	names := []string{g.data.FullName, "____________________", "Pejabat Berwenang"}
+	// Hanya satu kolom — nasabah
+	// Posisikan di tengah halaman agar terlihat rapi
+	sigColW := 80.0
+	sigX := marginL + (contentW-sigColW)/2 // center
 
 	startY := pdf.GetY()
 
-	// Header row (red background)
+	// Header kolom
 	g.setFillColor(colRed)
 	g.setTextColor(colWhite)
 	g.setFont("B", 8.5)
-	for i, h := range headers {
-		pdf.SetXY(marginL+float64(i)*colW, startY)
-		pdf.CellFormat(colW, 8, h, "1", 0, "C", true, 0, "")
-	}
+	pdf.SetXY(sigX, startY)
+	pdf.CellFormat(sigColW, 8, "Nasabah", "1", 0, "C", true, 0, "")
 	pdf.Ln(8)
 
-	// Signature space row
-	g.setFillColor(colWhite)
+	// Ruang tanda tangan (30mm)
 	sigY := pdf.GetY()
-	for i := 0; i < 3; i++ {
-		pdf.SetXY(marginL+float64(i)*colW, sigY)
-		pdf.CellFormat(colW, 24, "", "LR", 0, "C", false, 0, "")
-	}
-	pdf.Ln(24)
+	g.setFillColor(colWhite)
+	pdf.SetXY(sigX, sigY)
+	pdf.CellFormat(sigColW, 30, "", "LR", 0, "C", false, 0, "")
+	pdf.Ln(30)
 
-	// Name row
-	g.setFont("B", 8.5)
+	// Nama nasabah
 	nameY := pdf.GetY()
-	for i, n := range names {
-		pdf.SetXY(marginL+float64(i)*colW, nameY)
-		isBold := i == 0
-		if isBold {
-			g.setFont("B", 8.5)
-			g.setTextColor(colBlack)
-		} else {
-			g.setFont("", 7.5)
-			g.setTextColor(colDGray)
-		}
-		pdf.CellFormat(colW, 8, n, "LRB", 0, "C", false, 0, "")
-	}
+	g.setFont("B", 9)
+	g.setTextColor(colBlack)
+	pdf.SetXY(sigX, nameY)
+	pdf.CellFormat(sigColW, 8, g.data.FullName, "LRB", 0, "C", false, 0, "")
 	pdf.Ln(8)
 }
 
