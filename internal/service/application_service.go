@@ -127,7 +127,8 @@ type OCRInput struct {
 // Backend memverifikasi ke VIDA Fraud Mitigation API menggunakan
 // data identitas dari hasil OCR Step 3.
 type LivenessInput struct {
-	SelfieBase64 string // base64 selfie dari frontend (tanpa data URI prefix)
+	SelfieBase64  string // base64 selfie dari frontend (tanpa data URI prefix)
+	TransactionID string // transaction ID untuk verifikasi ke VIDA
 }
 
 // DisbursementInput captures Step 6: external bank account.
@@ -638,10 +639,19 @@ func (s *applicationService) SaveLivenessResult(ctx context.Context, appID strin
 		livenessStatus = "FAILED"
 	}
 
+	vidaRequestID := input.TransactionID
+	if vidaRequestID == "" {
+		// Fallback ke appID hanya jika tidak ada transaction_id
+		// (misal: mock mode atau SDK tidak return transaction_id)
+		vidaRequestID = appID
+		s.log.Warn("No transaction_id from VIDA SDK — using appID as fallback",
+			zap.String("app_id", appID))
+	}
+
 	result := &model.LivenessResult{
 		ID:              uuid.New().String(),
 		ApplicationID:   appID,
-		VidaRequestID:   appID,
+		VidaRequestID:   vidaRequestID,
 		LivenessStatus:  livenessStatus,
 		LivenessScore:   &fraudData.FaceMatchScore,
 		FaceMatchStatus: strPtrIfNotEmpty(faceMatchStatus),
