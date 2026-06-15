@@ -297,6 +297,24 @@ func (s *adminService) ApproveApplication(ctx context.Context, appID string, rev
 		return ErrForbiddenAction
 	}
 
+	appDetail, err := s.appRepo.FindByIDWithDetails(ctx, appID)
+	if err != nil {
+		return fmt.Errorf("load application details: %w", err)
+	}
+	if appDetail.LivenessResult == nil {
+		return fmt.Errorf("%w: liveness verification belum selesai", ErrInvalidStatusChange)
+	}
+	if appDetail.LivenessResult.FraudStatus != "003" && appDetail.LivenessResult.FraudStatus != "007" {
+		return fmt.Errorf(
+			"%w: verifikasi fraud VIDA belum selesai (status: %s, menunggu: 003)",
+			ErrInvalidStatusChange,
+			appDetail.LivenessResult.FraudStatus,
+		)
+	}
+	if appDetail.LivenessResult.KYCEventID == nil || *appDetail.LivenessResult.KYCEventID == "" {
+		return fmt.Errorf("%w: kyc_event_id belum tersedia", ErrInvalidStatusChange)
+	}
+
 	if err := s.appRepo.UpdateStatus(ctx, appID, model.StatusApproved); err != nil {
 		return fmt.Errorf("failed to update status: %w", err)
 	}

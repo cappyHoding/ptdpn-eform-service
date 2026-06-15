@@ -27,9 +27,11 @@ import (
 	"github.com/cappyHoding/ptdpn-eform-service/config"
 	"github.com/cappyHoding/ptdpn-eform-service/internal/api/handler"
 	"github.com/cappyHoding/ptdpn-eform-service/internal/api/router"
+	"github.com/cappyHoding/ptdpn-eform-service/internal/integration/ioh"
 	"github.com/cappyHoding/ptdpn-eform-service/internal/integration/vida"
 	"github.com/cappyHoding/ptdpn-eform-service/internal/repository"
 	"github.com/cappyHoding/ptdpn-eform-service/internal/service"
+	"github.com/cappyHoding/ptdpn-eform-service/internal/worker"
 	"github.com/cappyHoding/ptdpn-eform-service/pkg/email"
 	"github.com/cappyHoding/ptdpn-eform-service/pkg/jwt"
 	"github.com/cappyHoding/ptdpn-eform-service/pkg/logger"
@@ -142,6 +144,18 @@ func main() {
 		}
 	}
 
+	// IOH SMS Client
+	smsClient := ioh.NewSMSClient(
+		cfg.IOH.Username,
+		cfg.IOH.Password,
+		cfg.IOH.SenderID,
+	)
+	if cfg.IOH.Username != "" {
+		log.Info("IOH SMS client initialized", zap.String("sender_id", cfg.IOH.SenderID))
+	} else {
+		log.Warn("IOH SMS credentials not set — OTP will fail")
+	}
+
 	// STEP 6: Initialize Repositories
 	userRepo := repository.NewUserRepository(db)
 	auditRepo := repository.NewAuditRepository(db)
@@ -156,6 +170,7 @@ func main() {
 	vidaServices := vida.NewServices(cfg)
 	log.Info("VIDA services initialized")
 
+	otpSvc := service.NewOTPService(smsClient, redisClient, log)
 	authSvc := service.NewAuthService(userRepo, auditRepo, jwtManager, log)
 	notifSvc := service.NewNotificationService(mailer, notifRepo, log)
 	appSvc := service.NewApplicationService(appRepo, customerRepo, auditRepo, vidaServices, storageManager, notifSvc, log, cfg)
@@ -165,11 +180,24 @@ func main() {
 
 	// STEP 8: Initialize Handlers
 	handlers := &handler.Registry{
-		Application: handler.NewApplicationHandler(appSvc),
+		Application: handler.NewApplicationHandler(appSvc, otpSvc, log),
 		Auth:        handler.NewAuthHandler(authSvc),
 		Admin:       handler.NewAdminHandler(adminSvc),
 		Webhook:     handler.NewWebhookHandler(contractSvc, contractRepo, cfg.Vida.WebhookSecret, log),
 	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	fraudPollInterval := 30 * time.Minute
+	if cfg.Vida.MockFraud {
+		fraudPollInterval = 10 * time.Second
+		log.Warn("VIDA_FRAUD_MOCK=true: fraud poller interval dipercepat ke 10 detik")
+	}
+	fraudPoller := worker.NewFraudPoller(appRepo, vidaServices, smsClient, fraudPollInterval, log)
+
+	go fraudPoller.Start(ctx)
+	log.Info("Fraud poller started", zap.Duration("interval", fraudPollInterval))
 
 	// ── STEP 7: Set Up Router ─────────────────────────────────────────────────
 	httpRouter := router.Setup(router.Dependencies{
@@ -213,11 +241,6 @@ func main() {
 	// Block here until a signal is received
 	sig := <-quit
 	log.Info("Shutdown signal received", zap.String("signal", sig.String()))
-
-	// Give in-flight requests up to 30 seconds to complete before forcing shutdown.
-	// This prevents cutting off a customer in the middle of an OCR or liveness check.
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
 
 	if err := srv.Shutdown(ctx); err != nil {
 		log.Error("Server shutdown error", zap.Error(err))

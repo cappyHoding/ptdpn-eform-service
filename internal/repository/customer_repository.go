@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/cappyHoding/ptdpn-eform-service/internal/model"
 	"gorm.io/gorm"
@@ -15,6 +16,7 @@ type CustomerRepository interface {
 	FindByID(ctx context.Context, id string) (*model.Customer, error)
 	FindByNIK(ctx context.Context, nik string) (*model.Customer, error)
 	Update(ctx context.Context, customer *model.Customer) error
+	MarkPhoneVerified(ctx context.Context, appID string) error
 }
 
 type customerRepository struct {
@@ -65,6 +67,21 @@ func (r *customerRepository) FindByNIK(ctx context.Context, nik string) (*model.
 func (r *customerRepository) Update(ctx context.Context, customer *model.Customer) error {
 	if err := r.db.WithContext(ctx).Save(customer).Error; err != nil {
 		return fmt.Errorf("update customer failed: %w", err)
+	}
+	return nil
+}
+
+func (r *customerRepository) MarkPhoneVerified(ctx context.Context, appID string) error {
+	// Cari customer berdasarkan application_id
+	err := r.db.WithContext(ctx).
+		Model(&model.Customer{}).
+		Where("id = (SELECT customer_id FROM applications WHERE id = ? AND deleted_at IS NULL)", appID).
+		Updates(map[string]interface{}{
+			"phone_verified":    1,
+			"phone_verified_at": time.Now(),
+		}).Error
+	if err != nil {
+		return fmt.Errorf("MarkPhoneVerified: %w", err)
 	}
 	return nil
 }

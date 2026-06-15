@@ -18,6 +18,11 @@ type FraudService struct {
 	logger *zap.Logger
 }
 
+type FraudStatusResult struct {
+	Status     string // "001"|"002"|"003"|"004"|"006"|"007"
+	KYCEventID string // diisi saat status "003"
+}
+
 func NewFraudService(client *Client) *FraudService {
 	logger, _ := zap.NewProduction()
 	return &FraudService{client: client, logger: logger}
@@ -50,7 +55,7 @@ func (s *FraudService) VerifyIdentity(
 			zap.String("mock_nik", "3512001305908001"),
 		)
 		nik = "3512001305908001"
-		fullName = "UserIAABBBBBB"
+		fullName = "UserGDAA"
 		dob = "1990-06-13"
 	}
 
@@ -92,6 +97,7 @@ func (s *FraudService) VerifyIdentity(
 
 	// Ekstrak hasil assessment dari submit response (tidak perlu polling)
 	result := extractFraudDataFromSubmit(rawResp)
+	result.TransactionID = transactionID
 
 	s.logger.Info("Fraud assessment result",
 		zap.String("transaction_id", transactionID),
@@ -165,6 +171,56 @@ func extractFraudDataFromSubmit(resp map[string]interface{}) *FraudData {
 	return result
 }
 
+// Status:
+//
+//	001 = in progress
+//	002 = submitted for manual review (masih menunggu)
+//	003 = approved, certificate issued → KYCEventID tersedia
+//	004 = rejected by manual review
+//	006 = certificate not issued
+//	007 = certificate issued
+func (s *FraudService) GetFraudStatus(ctx context.Context, transactionID string) (*FraudStatusResult, error) {
+	var rawResp map[string]interface{}
+	err := s.client.doJSON(
+		ctx,
+		http.MethodGet,
+		fmt.Sprintf("/main/v2/services/fraud/%s/status", transactionID),
+		nil,
+		&rawResp,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("get fraud status failed: %w", err)
+	}
+
+	s.logger.Info("Fraud status response",
+		zap.String("transaction_id", transactionID),
+		zap.Any("response", rawResp),
+	)
+
+	status := extractStringField(rawResp, "status")
+	if status == "" {
+		// Coba nested data
+		if data, ok := rawResp["data"].(map[string]interface{}); ok {
+			status = extractStringField(data, "status")
+		}
+	}
+
+	result := &FraudStatusResult{Status: status}
+
+	// Jika status 003, ambil kyc_event_id (transaction_id dipakai sebagai kyc_event_id)
+	if status == "003" {
+		// Berdasarkan konfirmasi dari Abdi: gunakan transactionID sebagai kyc_event_id
+		result.KYCEventID = transactionID
+
+		s.logger.Info("Fraud approved — KYC event ID available",
+			zap.String("transaction_id", transactionID),
+			zap.String("kyc_event_id", result.KYCEventID),
+		)
+	}
+
+	return result, nil
+}
+
 // determineDecision menentukan keputusan akhir berdasarkan hasil assessment.
 //
 // Logika bisnis BPR Perdana:
@@ -235,6 +291,15 @@ func extractTransactionID(resp map[string]interface{}) string {
 					}
 				}
 			}
+		}
+	}
+	return ""
+}
+
+func extractStringField(m map[string]interface{}, key string) string {
+	if v, ok := m[key]; ok {
+		if s, ok := v.(string); ok {
+			return s
 		}
 	}
 	return ""

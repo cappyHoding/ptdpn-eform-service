@@ -127,8 +127,13 @@ type OCRInput struct {
 // Backend memverifikasi ke VIDA Fraud Mitigation API menggunakan
 // data identitas dari hasil OCR Step 3.
 type LivenessInput struct {
-	SelfieBase64  string // base64 selfie dari frontend (tanpa data URI prefix)
-	TransactionID string // transaction ID untuk verifikasi ke VIDA
+	SelfieBase64 string
+
+	// Dari VIDA Web SDK — untuk liveness_status
+	LivenessTransactionID string  // SDK transaction ID
+	LivenessScore         float64 // anti-spoofing score dari SDK
+	LivenessLiveImage     bool    // true jika live image
+	LivenessCode          int     // SDK result code (1041 = below threshold, dll)
 }
 
 // DisbursementInput captures Step 6: external bank account.
@@ -156,6 +161,11 @@ type CollateralInput struct {
 	Items []CollateralItemInput
 }
 
+type TransferProofInput struct {
+	ImageBase64 string
+	Filename    string
+}
+
 // ─── Service Errors ───────────────────────────────────────────────────────────
 
 var (
@@ -165,6 +175,7 @@ var (
 	ErrDisbursementRequired = errors.New("disbursement data is required for this product type")
 	ErrStepNotComplete      = errors.New("previous steps must be completed first")
 	ErrAlreadySubmitted     = errors.New("this application has already been submitted")
+	ErrPhoneNotVerified     = errors.New("phone number not verified")
 )
 
 // ─── Service Interface ────────────────────────────────────────────────────────
@@ -181,6 +192,7 @@ type ApplicationService interface {
 	// Get current state (for resume)
 	GetApplication(ctx context.Context, id string) (*model.Application, error)
 	GetApplicationWithDetails(ctx context.Context, id string) (*model.Application, error)
+	MarkPhoneVerified(ctx context.Context, appID string) error
 
 	// Step 3 - upload KTP image, call VIDA OCR, save result
 	ProcessOCR(ctx context.Context, appID string, input OCRInput) (*vida.OCRData, error)
@@ -197,6 +209,8 @@ type ApplicationService interface {
 
 	// Step 7
 	Submit(ctx context.Context, appID string) error
+
+	UploadPaymentProof(ctx context.Context, appID string, fileData []byte, filename string) error
 }
 
 // ─── Implementation ───────────────────────────────────────────────────────────
@@ -559,6 +573,17 @@ func (s *applicationService) SaveLivenessResult(ctx context.Context, appID strin
 		return fmt.Errorf("failed to load customer: %w", err)
 	}
 
+	sdkLivenessStatus := "PASSED"
+	sdkLivenessScore := input.LivenessScore
+
+	if !input.LivenessLiveImage || input.LivenessScore < 0.6 {
+		sdkLivenessStatus = "FAILED"
+	}
+	// Jika mock mode atau tidak ada data SDK, default PASSED
+	if input.LivenessTransactionID == "" && !s.cfg.Vida.MockFraud {
+		sdkLivenessStatus = "PASSED" // fallback
+	}
+
 	// ── Call VIDA Fraud API atau gunakan mock ─────────────────────────────────
 	var fraudData *vida.FraudData
 
@@ -634,36 +659,54 @@ func (s *applicationService) SaveLivenessResult(ctx context.Context, appID strin
 	if fraudData.FaceMatch {
 		faceMatchStatus = "MATCHED"
 	}
-	livenessStatus := "PASSED"
-	if fraudData.Decision == "REJECT" {
-		livenessStatus = "FAILED"
+
+	// Fraud API transaction ID untuk polling status VIDA
+	fraudTransactionID := fraudData.TransactionID
+
+	// VidaRequestID di DB = fraud transaction ID (untuk polling)
+	vidaRequestID := fraudTransactionID
+	if vidaRequestID == "" {
+		vidaRequestID = input.LivenessTransactionID // fallback ke SDK ID
+	}
+	if vidaRequestID == "" {
+		vidaRequestID = appID // last resort
 	}
 
-	vidaRequestID := input.TransactionID
-	if vidaRequestID == "" {
-		// Fallback ke appID hanya jika tidak ada transaction_id
-		// (misal: mock mode atau SDK tidak return transaction_id)
-		vidaRequestID = appID
-		s.log.Warn("No transaction_id from VIDA SDK — using appID as fallback",
-			zap.String("app_id", appID))
+	// ── 4. Tentukan fraud_status dan kyc_event_id ─────────────────────────────
+	fraudStatus := "002"
+	var kycEventID *string
+
+	if s.cfg.Vida.MockFraud {
+		fraudStatus = "003"
+		kid := vidaRequestID
+		kycEventID = &kid
 	}
 
 	result := &model.LivenessResult{
 		ID:              uuid.New().String(),
 		ApplicationID:   appID,
-		VidaRequestID:   vidaRequestID,
-		LivenessStatus:  livenessStatus,
-		LivenessScore:   &fraudData.FaceMatchScore,
+		VidaRequestID:   vidaRequestID, // fraud API transaction ID (untuk polling)
+		FraudStatus:     fraudStatus,
+		KYCEventID:      kycEventID,
+		LivenessStatus:  sdkLivenessStatus, // ← dari SDK, bukan dari Fraud API
+		LivenessScore:   &sdkLivenessScore, // ← dari SDK
 		FaceMatchStatus: strPtrIfNotEmpty(faceMatchStatus),
 		FaceMatchScore:  &fraudData.FaceMatchScore,
 		SelfieImagePath: selfiePath,
 		RawResponse: model.JSON{
-			"face_match":       fraudData.FaceMatch,
-			"face_match_score": fraudData.FaceMatchScore,
-			"dukcapil_match":   fraudData.DukcapilMatch,
-			"risk_level":       fraudData.RiskLevel,
-			"decision":         fraudData.Decision,
-			"mock":             s.cfg.Vida.MockFraud, // ← tandai ini mock
+			// Data dari SDK
+			"sdk_transaction_id": input.LivenessTransactionID,
+			"sdk_score":          input.LivenessScore,
+			"sdk_live_image":     input.LivenessLiveImage,
+			"sdk_code":           input.LivenessCode,
+			// Data dari Fraud API
+			"fraud_transaction_id": fraudTransactionID,
+			"face_match":           fraudData.FaceMatch,
+			"face_match_score":     fraudData.FaceMatchScore,
+			"dukcapil_match":       fraudData.DukcapilMatch,
+			"risk_level":           fraudData.RiskLevel,
+			"decision":             fraudData.Decision,
+			"mock":                 s.cfg.Vida.MockFraud,
 		},
 	}
 
@@ -953,12 +996,20 @@ func (s *applicationService) writeAudit(ctx context.Context, entry *model.AuditL
 
 func (s *applicationService) GetLivenessToken(ctx context.Context, appID string) (*LivenessTokenOutput, error) {
 	// Pastikan application ada
-	_, err := s.appRepo.FindByID(ctx, appID)
+	app, err := s.appRepo.FindByIDWithDetails(ctx, appID)
 	if err != nil {
 		if errors.Is(err, repository.ErrApplicationNotFound) {
 			return nil, ErrApplicationNotFound
 		}
 		return nil, fmt.Errorf("load application failed: %w", err)
+	}
+
+	// ── Guard: nomor HP harus sudah diverifikasi via OTP ─────────────────────
+	// Verifikasi dilakukan di Step 4 (UpdatePersonalInfo + OTP).
+	// Tanpa phone_verified, nasabah tidak bisa lanjut ke Step 5 (liveness).
+	if app.Customer.PhoneVerified == nil || !*app.Customer.PhoneVerified {
+		return nil, fmt.Errorf("%w: selesaikan verifikasi OTP terlebih dahulu",
+			ErrPhoneNotVerified)
 	}
 
 	// Ambil token dari VIDA OCR client (credential OCR dan Fraud sama)
@@ -986,6 +1037,67 @@ func (s *applicationService) GetLivenessToken(ctx context.Context, appID string)
 		ExpiresIn:   expiresIn,
 		ExpiresAt:   expiresAt,
 	}, nil
+}
+
+func (s *applicationService) MarkPhoneVerified(ctx context.Context, appID string) error {
+	return s.customerRepo.MarkPhoneVerified(ctx, appID)
+}
+
+// UploadPaymentProof menyimpan bukti transfer nasabah.
+// Hanya berlaku untuk produk SAVING dan DEPOSIT.
+// Tidak ada workflow validasi — hanya disimpan sebagai dokumentasi.
+func (s *applicationService) UploadPaymentProof(
+	ctx context.Context,
+	appID string,
+	fileData []byte,
+	filename string,
+) error {
+	app, err := s.appRepo.FindByID(ctx, appID)
+	if err != nil {
+		if errors.Is(err, repository.ErrApplicationNotFound) {
+			return ErrApplicationNotFound
+		}
+		return err
+	}
+
+	// Hanya untuk SAVING dan DEPOSIT
+	if app.ProductType != model.ProductSaving && app.ProductType != model.ProductDeposit {
+		return fmt.Errorf("%w: upload bukti transfer hanya untuk produk Tabungan dan Deposito",
+			ErrMissingRequiredData)
+	}
+
+	// Hanya bisa upload setelah status COMPLETED
+	if app.Status != model.StatusCompleted {
+		return fmt.Errorf("%w: pengajuan belum selesai ditandatangani",
+			ErrStepNotComplete)
+	}
+
+	// Simpan file
+	ext := filepath.Ext(filename)
+	if ext == "" {
+		ext = ".jpg"
+	}
+	saveName := appID + "_proof" + ext
+	proofPath, err := s.storage.SaveFile(
+		storage.FileTypePaymentProof,
+		saveName,
+		bytes.NewReader(fileData),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to save payment proof: %w", err)
+	}
+
+	// Update DB
+	now := time.Now()
+	if err := s.appRepo.UpdatePaymentProof(ctx, appID, proofPath, now); err != nil {
+		return fmt.Errorf("failed to update payment proof: %w", err)
+	}
+
+	s.log.Info("Payment proof uploaded",
+		zap.String("app_id", appID),
+		zap.String("path", proofPath),
+	)
+	return nil
 }
 
 // openFileFromPath membuka file dari path untuk dibaca ulang.

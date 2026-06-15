@@ -3,21 +3,35 @@ package handler
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"path/filepath"
 	"strings"
 
 	"github.com/cappyHoding/ptdpn-eform-service/internal/service"
+	"github.com/cappyHoding/ptdpn-eform-service/pkg/logger"
 	"github.com/cappyHoding/ptdpn-eform-service/pkg/response"
 	"github.com/gin-gonic/gin"
+	"go.uber.org/zap"
 )
 
 // ApplicationHandler handles all customer-facing form endpoints.
 type ApplicationHandler struct {
 	appService service.ApplicationService
+	otpSvc     service.OTPService
+	log        *logger.Logger
 }
 
-func NewApplicationHandler(appService service.ApplicationService) *ApplicationHandler {
-	return &ApplicationHandler{appService: appService}
+func NewApplicationHandler(
+	appService service.ApplicationService,
+	otpSvc service.OTPService,
+	log *logger.Logger,
+) *ApplicationHandler {
+	return &ApplicationHandler{
+		appService: appService,
+		otpSvc:     otpSvc,
+		log:        log,
+	}
 }
 
 // ─── Request DTOs ─────────────────────────────────────────────────────────────
@@ -82,8 +96,14 @@ type personalInfoRequest struct {
 type livenessRequest struct {
 	// Selfie base64 dari VIDA Web SDK — tanpa data URI prefix
 	// (tanpa "data:image/jpeg;base64,")
-	SelfieBase64  string `json:"selfie_base64" binding:"required"`
-	TransactionID string `json:"transaction_id"`
+	SelfieBase64 string `json:"selfie_base64" binding:"required"`
+
+	// Liveness result dari VIDA Web SDK
+	LivenessTransactionID string  `json:"liveness_transaction_id"` // SDK transaction ID
+	LivenessScore         float64 `json:"liveness_score"`          // anti-spoofing score
+	LivenessLiveImage     bool    `json:"liveness_live_image"`     // true = live image
+	LivenessCode          int     `json:"liveness_code"`           // SDK result code
+	LivenessMessage       string  `json:"liveness_message"`        // SDK result message
 }
 
 type disbursementRequest struct {
@@ -307,7 +327,11 @@ func (h *ApplicationHandler) SubmitLiveness(c *gin.Context) {
 	}
 
 	err := h.appService.SaveLivenessResult(c.Request.Context(), appID, service.LivenessInput{
-		SelfieBase64: req.SelfieBase64,
+		SelfieBase64:          req.SelfieBase64,
+		LivenessTransactionID: req.LivenessTransactionID, // dari SDK
+		LivenessScore:         req.LivenessScore,
+		LivenessLiveImage:     req.LivenessLiveImage,
+		LivenessCode:          req.LivenessCode,
 	})
 	if err != nil {
 		handleAppError(c, err)
@@ -486,6 +510,136 @@ func (h *ApplicationHandler) TrackStatus(c *gin.Context) {
 	})
 }
 
+// SendOTP handles POST /api/v1/applications/:id/otp/send
+// Mengirim kode OTP ke nomor HP nasabah via SMS IOH.
+// Nomor HP diambil dari data yang sudah diisi di Step 4 (UpdatePersonalInfo).
+func (h *ApplicationHandler) SendOTP(c *gin.Context) {
+	appID := c.Param("id") // session sudah divalidasi oleh middleware
+
+	// Load detail aplikasi untuk mendapatkan nomor HP
+	app, err := h.appService.GetApplicationWithDetails(c.Request.Context(), appID)
+	if err != nil {
+		handleAppError(c, err)
+		return
+	}
+	if app.Customer.PhoneNumber == nil || *app.Customer.PhoneNumber == "" {
+		response.BadRequest(c, "Nomor HP belum diisi. Lengkapi data pribadi terlebih dahulu.")
+		return
+	}
+
+	if err := h.otpSvc.SendOTP(c.Request.Context(), appID, *app.Customer.PhoneNumber); err != nil {
+		switch {
+		case strings.HasPrefix(err.Error(), "OTP_COOLDOWN:"):
+			secs := strings.TrimPrefix(err.Error(), "OTP_COOLDOWN:")
+			response.BadRequest(c, fmt.Sprintf("Tunggu %s detik sebelum mengirim OTP lagi.", secs))
+		default:
+			h.log.Error("SendOTP failed",
+				zap.String("app_id", appID),
+				zap.Error(err),
+			)
+			response.InternalError(c, "Gagal mengirim OTP. Coba lagi beberapa saat.")
+		}
+		return
+	}
+
+	response.OK(c, "Kode OTP berhasil dikirim ke nomor HP Anda.", nil)
+}
+
+// VerifyOTP handles POST /api/v1/applications/:id/otp/verify
+// Memverifikasi kode OTP yang dikirimkan ke nasabah.
+type verifyOTPRequest struct {
+	Code string `json:"code" binding:"required"`
+}
+
+func (h *ApplicationHandler) VerifyOTP(c *gin.Context) {
+	appID := c.Param("id")
+
+	var req verifyOTPRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "Kode OTP wajib diisi.")
+		return
+	}
+
+	if err := h.otpSvc.VerifyOTP(c.Request.Context(), appID, req.Code); err != nil {
+		switch {
+		case strings.HasPrefix(err.Error(), "OTP_INVALID:"):
+			remaining := strings.TrimPrefix(err.Error(), "OTP_INVALID:")
+			response.BadRequest(c, fmt.Sprintf("Kode OTP salah. Sisa %s percobaan.", remaining))
+		case err.Error() == "OTP_EXPIRED":
+			response.BadRequest(c, "Kode OTP sudah kedaluwarsa. Silakan kirim ulang.")
+		case strings.HasPrefix(err.Error(), "OTP_LOCKED:"):
+			secs := strings.TrimPrefix(err.Error(), "OTP_LOCKED:")
+			response.BadRequest(c, fmt.Sprintf("Terlalu banyak percobaan. Coba lagi dalam %s detik.", secs))
+		default:
+			h.log.Error("VerifyOTP failed",
+				zap.String("app_id", appID),
+				zap.Error(err),
+			)
+			response.InternalError(c, "Gagal verifikasi OTP.")
+		}
+		return
+	}
+
+	// OTP benar — tandai nomor HP sudah terverifikasi
+	if err := h.appService.MarkPhoneVerified(c.Request.Context(), appID); err != nil {
+		h.log.Error("MarkPhoneVerified failed",
+			zap.String("app_id", appID),
+			zap.Error(err),
+		)
+		// Tidak block response — OTP sudah verified, hanya update DB yang gagal
+	}
+
+	response.OK(c, "Nomor HP berhasil diverifikasi. Lanjutkan ke proses verifikasi wajah.", gin.H{
+		"phone_verified": true,
+	})
+}
+
+// UploadPaymentProof handles POST /api/v1/applications/:id/payment-proof
+// Menerima file gambar bukti transfer. Endpoint ini PUBLIC (tidak butuh session)
+// karena customer mungkin membuka dari device berbeda setelah TTD kontrak.
+func (h *ApplicationHandler) UploadPaymentProof(c *gin.Context) {
+	appID := c.Param("id")
+
+	// Ambil file dari multipart form
+	file, header, err := c.Request.FormFile("file")
+	if err != nil {
+		response.BadRequest(c, "File bukti transfer wajib dilampirkan")
+		return
+	}
+	defer file.Close()
+
+	// Validasi ukuran file (max 5MB)
+	const maxSize = 5 << 20
+	if header.Size > maxSize {
+		response.BadRequest(c, "Ukuran file maksimal 5MB")
+		return
+	}
+
+	// Validasi tipe file
+	ext := strings.ToLower(filepath.Ext(header.Filename))
+	allowed := map[string]bool{".jpg": true, ".jpeg": true, ".png": true, ".pdf": true}
+	if !allowed[ext] {
+		response.BadRequest(c, "Format file harus JPG, PNG, atau PDF")
+		return
+	}
+
+	// Baca file
+	fileData, err := io.ReadAll(file)
+	if err != nil {
+		response.InternalError(c, "")
+		return
+	}
+
+	if err := h.appService.UploadPaymentProof(
+		c.Request.Context(), appID, fileData, header.Filename,
+	); err != nil {
+		handleAppError(c, err)
+		return
+	}
+
+	response.OK(c, "Bukti transfer berhasil diunggah. Terima kasih!", nil)
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 // handleAppError maps service errors to HTTP responses.
@@ -501,6 +655,8 @@ func handleAppError(c *gin.Context, err error) {
 		response.BadRequest(c, err.Error())
 	case errors.Is(err, service.ErrDisbursementRequired):
 		response.BadRequest(c, "Bank account information is required for this product type")
+	case errors.Is(err, service.ErrPhoneNotVerified): // ← tambah
+		response.Forbidden(c, "Nomor HP belum diverifikasi. Selesaikan verifikasi OTP terlebih dahulu.")
 	default:
 		response.InternalError(c, "")
 	}

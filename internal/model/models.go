@@ -43,19 +43,21 @@ func (InternalUser) TableName() string { return "internal_users" }
 // Customer maps to the `customers` table.
 // PII (Personally Identifiable Information) — handle with extra care.
 type Customer struct {
-	ID                string  `gorm:"column:id;type:char(36);primaryKey"          json:"id"`
-	NIK               *string `gorm:"column:nik;type:varchar(16)"                 json:"nik,omitempty"`
-	FullName          *string `gorm:"column:full_name;type:varchar(100)"           json:"full_name,omitempty"`
-	MothersMaidenName *string `gorm:"column:mothers_maiden_name;type:varchar(100)" json:"mothers_maiden_name,omitempty"`
-	CurrentAddress    *string `gorm:"column:current_address;type:text"            json:"current_address,omitempty"`
-	Occupation        *string `gorm:"column:occupation;type:varchar(100)"         json:"occupation,omitempty"`
-	WorkDuration      *string `gorm:"column:work_duration;type:varchar(50)"       json:"work_duration,omitempty"`
-	MonthlyIncome     *uint64 `gorm:"column:monthly_income"                       json:"monthly_income,omitempty"`
-	Education         *string `gorm:"column:education"                            json:"education,omitempty"`
-	Email             *string `gorm:"column:email;type:varchar(100)"              json:"email,omitempty"`
-	PhoneNumber       *string `gorm:"column:phone_number;type:varchar(20)"        json:"phone_number,omitempty"`
-	PhoneNumberWA     *string `gorm:"column:phone_number_wa;type:varchar(20)"     json:"phone_number_wa,omitempty"`
-	WorkAddress       *string `gorm:"column:work_address;type:text"               json:"work_address,omitempty"`
+	ID                string     `gorm:"column:id;type:char(36);primaryKey"          json:"id"`
+	NIK               *string    `gorm:"column:nik;type:varchar(16)"                 json:"nik,omitempty"`
+	FullName          *string    `gorm:"column:full_name;type:varchar(100)"           json:"full_name,omitempty"`
+	MothersMaidenName *string    `gorm:"column:mothers_maiden_name;type:varchar(100)" json:"mothers_maiden_name,omitempty"`
+	CurrentAddress    *string    `gorm:"column:current_address;type:text"            json:"current_address,omitempty"`
+	Occupation        *string    `gorm:"column:occupation;type:varchar(100)"         json:"occupation,omitempty"`
+	WorkDuration      *string    `gorm:"column:work_duration;type:varchar(50)"       json:"work_duration,omitempty"`
+	MonthlyIncome     *uint64    `gorm:"column:monthly_income"                       json:"monthly_income,omitempty"`
+	Education         *string    `gorm:"column:education"                            json:"education,omitempty"`
+	Email             *string    `gorm:"column:email;type:varchar(100)"              json:"email,omitempty"`
+	PhoneNumber       *string    `gorm:"column:phone_number;type:varchar(20)"        json:"phone_number,omitempty"`
+	PhoneNumberWA     *string    `gorm:"column:phone_number_wa;type:varchar(20)"     json:"phone_number_wa,omitempty"`
+	PhoneVerified     *bool      `gorm:"column:phone_verified;default:false"  json:"phone_verified"`
+	PhoneVerifiedAt   *time.Time `gorm:"column:phone_verified_at"             json:"phone_verified_at,omitempty"`
+	WorkAddress       *string    `gorm:"column:work_address;type:text"               json:"work_address,omitempty"`
 	Base
 }
 
@@ -89,6 +91,7 @@ const (
 	StatusPendingReview ApplicationStatus = "PENDING_REVIEW"
 	StatusInReview      ApplicationStatus = "IN_REVIEW"
 	StatusRecommended   ApplicationStatus = "RECOMMENDED"
+	StatusFraudRejected ApplicationStatus = "FRAUD_REJECTED"
 	StatusApproved      ApplicationStatus = "APPROVED"
 	StatusRejected      ApplicationStatus = "REJECTED"
 	StatusSigning       ApplicationStatus = "SIGNING"
@@ -133,6 +136,8 @@ type Application struct {
 	OCRResult        *OCRResult        `gorm:"foreignKey:ApplicationID" json:"ocr_result,omitempty"`
 	LivenessResult   *LivenessResult   `gorm:"foreignKey:ApplicationID" json:"liveness_result,omitempty"`
 	ContractDocument *ContractDocument `gorm:"foreignKey:ApplicationID" json:"contract_document,omitempty"`
+	PaymentProofPath *string           `gorm:"column:payment_proof_path" json:"payment_proof_path,omitempty"`
+	PaymentProofAt   *time.Time        `gorm:"column:payment_proof_at"   json:"payment_proof_at,omitempty"`
 	Base
 }
 
@@ -282,7 +287,10 @@ type LivenessResult struct {
 	LivenessScore   *float64 `gorm:"column:liveness_score;type:decimal(5,4)"        json:"liveness_score,omitempty"`
 	FaceMatchStatus *string  `gorm:"column:face_match_status"                       json:"face_match_status,omitempty"`
 	FaceMatchScore  *float64 `gorm:"column:face_match_score;type:decimal(5,4)"      json:"face_match_score,omitempty"`
-	SelfieImagePath *string  `gorm:"column:selfie_image_path;type:varchar(500)"     json:"-"`
+	// ── Fraud status polling fields ───────────────────────────────────────────
+	FraudStatus     string  `gorm:"column:fraud_status;default:001"                json:"fraud_status"`
+	KYCEventID      *string `gorm:"column:kyc_event_id;type:varchar(100)"          json:"kyc_event_id,omitempty"`
+	SelfieImagePath *string `gorm:"column:selfie_image_path;type:varchar(500)"     json:"-"`
 	Base
 }
 
