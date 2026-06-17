@@ -180,7 +180,7 @@ func main() {
 
 	// STEP 8: Initialize Handlers
 	handlers := &handler.Registry{
-		Application: handler.NewApplicationHandler(appSvc, otpSvc, log),
+		Application: handler.NewApplicationHandler(appSvc, contractSvc, otpSvc, log),
 		Auth:        handler.NewAuthHandler(authSvc),
 		Admin:       handler.NewAdminHandler(adminSvc),
 		Webhook:     handler.NewWebhookHandler(contractSvc, contractRepo, cfg.Vida.WebhookSecret, log),

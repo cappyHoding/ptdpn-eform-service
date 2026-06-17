@@ -335,9 +335,13 @@ type ContractDocument struct {
 	SignLink          *string    `gorm:"column:sign_link;type:varchar(500)"          json:"sign_link,omitempty"`
 	SignLinkSentAt    *time.Time `gorm:"column:sign_link_sent_at"                    json:"sign_link_sent_at,omitempty"`
 	SignDeadline      *time.Time `gorm:"column:sign_deadline"                        json:"sign_deadline,omitempty"`
-	SignedAt          *time.Time `gorm:"column:signed_at"                            json:"signed_at,omitempty"`
-	SignedFilePath    *string    `gorm:"column:signed_file_path;type:varchar(500)"   json:"-"`
-	GeneratedAt       time.Time  `gorm:"column:generated_at;autoCreateTime"          json:"generated_at"`
+	SignedAt            *time.Time `gorm:"column:signed_at"                              json:"signed_at,omitempty"`
+	SignedFilePath      *string    `gorm:"column:signed_file_path;type:varchar(500)"     json:"-"`
+	// ── eSign TOS acceptance (agreement page sebelum redirect ke VIDA) ────────
+	ESignTOSAccepted   bool       `gorm:"column:esign_tos_accepted;default:0"           json:"esign_tos_accepted"`
+	ESignTOSAcceptedAt *time.Time `gorm:"column:esign_tos_accepted_at"                  json:"esign_tos_accepted_at,omitempty"`
+	ESignTOSIP         *string    `gorm:"column:esign_tos_ip;type:varchar(45)"          json:"-"` // internal audit
+	GeneratedAt        time.Time  `gorm:"column:generated_at;autoCreateTime"            json:"generated_at"`
 	Base
 }
 

@@ -17,20 +17,23 @@ import (
 
 // ApplicationHandler handles all customer-facing form endpoints.
 type ApplicationHandler struct {
-	appService service.ApplicationService
-	otpSvc     service.OTPService
-	log        *logger.Logger
+	appService   service.ApplicationService
+	contractSvc  service.ContractService
+	otpSvc       service.OTPService
+	log          *logger.Logger
 }
 
 func NewApplicationHandler(
 	appService service.ApplicationService,
+	contractSvc service.ContractService,
 	otpSvc service.OTPService,
 	log *logger.Logger,
 ) *ApplicationHandler {
 	return &ApplicationHandler{
-		appService: appService,
-		otpSvc:     otpSvc,
-		log:        log,
+		appService:  appService,
+		contractSvc: contractSvc,
+		otpSvc:      otpSvc,
+		log:         log,
 	}
 }
 
@@ -638,6 +641,41 @@ func (h *ApplicationHandler) UploadPaymentProof(c *gin.Context) {
 	}
 
 	response.OK(c, "Bukti transfer berhasil diunggah. Terima kasih!", nil)
+}
+
+// ─── eSign Agreement Page Handlers ────────────────────────────────────────────
+
+// GetESignAgreement handles GET /api/v1/applications/:id/esign-agreement
+// PUBLIC — tidak butuh session token. Dibuka dari email link nasabah.
+// Mengembalikan data ringkasan kontrak untuk ditampilkan di halaman agreement.
+func (h *ApplicationHandler) GetESignAgreement(c *gin.Context) {
+	appID := c.Param("id")
+
+	data, err := h.contractSvc.GetContractForAgreement(c.Request.Context(), appID)
+	if err != nil {
+		handleAppError(c, err)
+		return
+	}
+
+	response.OK(c, "Contract agreement data retrieved", data)
+}
+
+// AcceptESignTOS handles POST /api/v1/applications/:id/esign-tos
+// PUBLIC — tidak butuh session token.
+// Menyimpan flag persetujuan TOS nasabah lalu mengembalikan sign_link VIDA.
+// Frontend akan redirect ke sign_link ini setelah menerima response.
+func (h *ApplicationHandler) AcceptESignTOS(c *gin.Context) {
+	appID := c.Param("id")
+
+	signLink, err := h.contractSvc.AcceptESignTOS(c.Request.Context(), appID, c.ClientIP())
+	if err != nil {
+		handleAppError(c, err)
+		return
+	}
+
+	response.OK(c, "TOS accepted. Redirect customer to sign link.", gin.H{
+		"sign_link": signLink,
+	})
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
