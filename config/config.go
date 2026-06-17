@@ -23,17 +23,19 @@ import (
 
 // Config is the root configuration struct.
 type Config struct {
-	App      AppConfig
-	Database DatabaseConfig
-	Redis    RedisConfig
-	JWT      JWTConfig
-	Session  SessionConfig
-	Storage  StorageConfig
-	Vida     VidaConfig
-	Email    EmailConfig
-	WhatsApp WhatsAppConfig
-	Rate     RateLimitConfig
-	Log      LogConfig
+	App         AppConfig
+	Database    DatabaseConfig
+	Redis       RedisConfig
+	JWT         JWTConfig
+	Session     SessionConfig
+	Storage     StorageConfig
+	Vida        VidaConfig
+	Email       EmailConfig
+	WhatsApp    WhatsAppConfig
+	Rate        RateLimitConfig
+	Log         LogConfig
+	IOH         IOHConfig
+	FraudPoller FraudPollerConfig
 }
 
 // AppConfig holds general application settings.
@@ -220,6 +222,17 @@ type LogConfig struct {
 	Output string // LOG_OUTPUT: stdout | file path
 }
 
+type IOHConfig struct {
+	SMSURL   string
+	Username string
+	Password string
+	SenderID string
+}
+
+type FraudPollerConfig struct {
+	Interval time.Duration
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Load reads configuration from environment variables (or .env file in dev).
@@ -368,6 +381,19 @@ func Load() (*Config, error) {
 		Level:  v.GetString("LOG_LEVEL"),
 		Format: v.GetString("LOG_FORMAT"),
 		Output: v.GetString("LOG_OUTPUT"),
+	}
+
+	cfg.IOH = IOHConfig{
+		SMSURL:   v.GetString("IOH_SMS_URL"),
+		Username: v.GetString("IOH_SMS_USERNAME"),
+		Password: v.GetString("IOH_SMS_PASSWORD"),
+		SenderID: v.GetString("IOH_SMS_SENDER_ID"),
+	}
+	cfg.FraudPoller = FraudPollerConfig{
+		Interval: v.GetDuration("FRAUD_POLL_INTERVAL"),
+	}
+	if cfg.FraudPoller.Interval == 0 {
+		cfg.FraudPoller.Interval = 30 * time.Minute // default
 	}
 
 	if err := validate(cfg); err != nil {

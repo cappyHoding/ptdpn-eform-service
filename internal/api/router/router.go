@@ -108,6 +108,8 @@ func setupCustomerRoutes(v1 *gin.RouterGroup, deps Dependencies) {
 
 	apps.GET("/track", h.Application.TrackStatus)
 
+	apps.POST("/:id/payment-proof", h.Application.UploadPaymentProof)
+
 	// Steps 3-7 — Require valid X-Session-Token header
 	// The session middleware validates the token and binds it to the application ID
 	sessionRequired := apps.Group("")
@@ -116,6 +118,8 @@ func setupCustomerRoutes(v1 *gin.RouterGroup, deps Dependencies) {
 		sessionRequired.GET("/:id", h.Application.GetByID)
 		sessionRequired.POST("/:id/ocr", h.Application.SubmitOCR)                     // Step 3
 		sessionRequired.PATCH("/:id/personal-info", h.Application.UpdatePersonalInfo) // Step 4
+		sessionRequired.POST("/:id/otp/send", h.Application.SendOTP)
+		sessionRequired.POST("/:id/otp/verify", h.Application.VerifyOTP)
 		sessionRequired.GET("/:id/liveness/token", h.Application.GetLivenessToken)
 		sessionRequired.POST("/:id/liveness", h.Application.SubmitLiveness)          // Step 5
 		sessionRequired.PATCH("/:id/disbursement", h.Application.UpdateDisbursement) // Step 6

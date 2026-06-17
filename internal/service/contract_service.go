@@ -493,15 +493,8 @@ func derefUint64(u *uint64) uint64 {
 }
 
 func getKYCEventID(app *model.Application) string {
-	if app.LivenessResult != nil && app.LivenessResult.VidaRequestID != "" {
-		kycID := app.LivenessResult.VidaRequestID
-		// Log untuk verifikasi — apakah ini real VIDA ID atau fallback appID
-		isRealID := kycID != app.ID
-		if !isRealID {
-			// Warning: masih pakai appID sebagai fallback
-			// Ini normal untuk mock liveness, tapi tidak untuk production
-		}
-		return kycID
+	if app.LivenessResult != nil && app.LivenessResult.KYCEventID != nil {
+		return *app.LivenessResult.KYCEventID // ← dari fraud polling, bukan VidaRequestID
 	}
 	return ""
 }

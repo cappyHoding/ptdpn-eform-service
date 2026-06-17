@@ -131,6 +131,7 @@ type FraudData struct {
 	DukcapilMatch bool   `json:"dukcapil_match"`
 	RiskLevel     string `json:"risk_level"` // "LOW" | "MEDIUM" | "HIGH"
 	Decision      string `json:"decision"`   // "ACCEPT" | "REJECT" | "REVIEW"
+	TransactionID string `json:"transaction_id"`
 }
 
 // ─── eMeterai ─────────────────────────────────────────────────────────────────

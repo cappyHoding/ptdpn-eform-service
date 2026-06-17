@@ -28,10 +28,11 @@ import (
 type FileType string
 
 const (
-	FileTypeKTP        FileType = "ktp"
-	FileTypeSelfie     FileType = "selfie"
-	FileTypeCollateral FileType = "collateral"
-	FileTypeContract   FileType = "contracts"
+	FileTypeKTP          FileType = "ktp"
+	FileTypeSelfie       FileType = "selfie"
+	FileTypeCollateral   FileType = "collateral"
+	FileTypeContract     FileType = "contracts"
+	FileTypePaymentProof FileType = "payment-proof"
 )
 
 // Manager handles all file I/O operations.

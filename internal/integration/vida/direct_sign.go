@@ -235,10 +235,10 @@ func (s *DirectSignService) createEnvelope(ctx context.Context, input CreateEnve
 	// Build envelope_details JSON
 	details := directSignEnvelopeDetails{
 		EnvelopeName:   input.EnvelopeName,
-		DirectSign:     true,      // WAJIB true
-		Preview:        true,      // nasabah bisa preview dokumen sebelum TTD
-		NotifyEmail:    false,     // kita handle email sendiri via notification_service
-		SignatureType:  "DIGITAL", // "DIGITAL" = legal binding, "ESIGN" = non-binding
+		DirectSign:     true,    // WAJIB true
+		Preview:        true,    // nasabah bisa preview dokumen sebelum TTD
+		NotifyEmail:    false,   // kita handle email sendiri via notification_service
+		SignatureType:  "ESIGN", // "DIGITAL" = legal binding, "ESIGN" = non-binding
 		ExpirationDays: input.ExpirationDays,
 
 		Recipients: []directSignRecipient{

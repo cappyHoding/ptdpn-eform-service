@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/cappyHoding/ptdpn-eform-service/internal/model"
 	"gorm.io/gorm"
@@ -30,6 +31,8 @@ type ApplicationRepository interface {
 	// eKYC results
 	UpsertOCRResult(ctx context.Context, result *model.OCRResult) error
 	UpsertLivenessResult(ctx context.Context, result *model.LivenessResult) error
+	FindPendingFraudApps(ctx context.Context) ([]model.Application, error)
+	UpdateLivenessFraudStatus(ctx context.Context, appID, fraudStatus, kycEventID string) error
 
 	// Session
 	CreateSession(ctx context.Context, session *model.CustomerSession) error
@@ -45,6 +48,8 @@ type ApplicationRepository interface {
 
 	// Dashboard
 	GetDashboardStats(ctx context.Context) (map[string]int64, error)
+
+	UpdatePaymentProof(ctx context.Context, appID string, path string, at time.Time) error
 }
 
 // ListApplicationsParams holds filters for the admin dashboard list.
@@ -521,6 +526,58 @@ func (r *applicationRepository) UpsertCollateralItems(ctx context.Context, appID
 		}
 		return nil
 	})
+}
+
+// FindPendingFraudApps mencari aplikasi yang fraud statusnya masih pending
+// (001 = in progress, 002 = submitted for manual review).
+// Dipakai oleh FraudPoller.
+func (r *applicationRepository) FindPendingFraudApps(ctx context.Context) ([]model.Application, error) {
+	var apps []model.Application
+	err := r.db.WithContext(ctx).
+		Joins("JOIN liveness_results lr ON lr.application_id = applications.id AND lr.deleted_at IS NULL").
+		Where("applications.deleted_at IS NULL").
+		Where("lr.fraud_status IN ('001', '002')").
+		// Hanya aplikasi yang aktif (belum selesai/ditolak)
+		Where("applications.status NOT IN ('FRAUD_REJECTED', 'REJECTED', 'COMPLETED', 'EXPIRED')").
+		Preload("LivenessResult").
+		Find(&apps).Error
+	if err != nil {
+		return nil, fmt.Errorf("FindPendingFraudApps: %w", err)
+	}
+	return apps, nil
+}
+
+// UpdateLivenessFraudStatus mengupdate fraud_status dan kyc_event_id di liveness_results.
+func (r *applicationRepository) UpdateLivenessFraudStatus(
+	ctx context.Context,
+	appID, fraudStatus, kycEventID string,
+) error {
+	updates := map[string]interface{}{
+		"fraud_status": fraudStatus,
+	}
+	if kycEventID != "" {
+		updates["kyc_event_id"] = kycEventID
+	}
+	err := r.db.WithContext(ctx).
+		Model(&model.LivenessResult{}).
+		Where("application_id = ?", appID).
+		Updates(updates).Error
+	if err != nil {
+		return fmt.Errorf("UpdateLivenessFraudStatus: %w", err)
+	}
+	return nil
+}
+
+func (r *applicationRepository) UpdatePaymentProof(
+	ctx context.Context, appID string, path string, at time.Time,
+) error {
+	return r.db.WithContext(ctx).
+		Model(&model.Application{}).
+		Where("id = ? AND deleted_at IS NULL", appID).
+		Updates(map[string]interface{}{
+			"payment_proof_path": path,
+			"payment_proof_at":   at,
+		}).Error
 }
 
 // Ensure new methods are declared in the interface — add them inline:
