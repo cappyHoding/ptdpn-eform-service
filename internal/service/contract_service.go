@@ -34,6 +34,24 @@ type ContractService interface {
 
 	// FailContract dipanggil webhook ketika sign expired/failed.
 	FailContract(ctx context.Context, vidaTransactionID string, reason string) error
+
+	// GetContractForAgreement mengembalikan data ringkasan kontrak untuk ditampilkan
+	// di halaman agreement sebelum nasabah diarahkan ke link TTD VIDA.
+	// Endpoint ini PUBLIC — tidak butuh session token.
+	GetContractForAgreement(ctx context.Context, appID string) (*ContractAgreementData, error)
+
+	// AcceptESignTOS menyimpan flag persetujuan TOS nasabah lalu mengembalikan
+	// sign_link VIDA agar frontend bisa redirect.
+	AcceptESignTOS(ctx context.Context, appID string, ip string) (string, error)
+}
+
+// ContractAgreementData adalah data yang dikembalikan untuk halaman agreement.
+type ContractAgreementData struct {
+	ApplicationID   string     `json:"application_id"`
+	CustomerName    string     `json:"customer_name"`
+	ProductType     string     `json:"product_type"`
+	SignDeadline    *time.Time `json:"sign_deadline"`
+	TOSAlreadyAccepted bool    `json:"tos_already_accepted"`
 }
 
 type contractService struct {
@@ -44,7 +62,7 @@ type contractService struct {
 	storage      *storage.Manager
 	logoPath     string              // path ke file logo perusahaan
 	serverIP     string              // IP server untuk eSign requestInfo.srcIp
-	notifSvc     NotificationService // ← tambah ini
+	notifSvc     NotificationService
 	cfg          *config.Config
 	log          *logger.Logger
 }
@@ -56,8 +74,8 @@ func NewContractService(
 	vidaServices *vida.Services,
 	storageManager *storage.Manager,
 	logoPath string,
-	notifSvc NotificationService, // ← tambah ini
-	cfg *config.Config, // ← tambah ini
+	notifSvc NotificationService,
+	cfg *config.Config,
 	log *logger.Logger,
 ) ContractService {
 	return &contractService{
@@ -68,8 +86,8 @@ func NewContractService(
 		storage:      storageManager,
 		logoPath:     logoPath,
 		serverIP:     getOutboundIP(),
-		notifSvc:     notifSvc, // ← set ini
-		cfg:          cfg,      // ← set ini
+		notifSvc:     notifSvc,
+		cfg:          cfg,
 		log:          log,
 	}
 }
@@ -231,7 +249,10 @@ func (s *contractService) InitiateContract(ctx context.Context, appID string, ac
 	}
 
 	if s.notifSvc != nil {
-		if err := s.notifSvc.SendESignLink(context.Background(), app, signingURL, deadline); err != nil {
+		// Kirim link ke halaman agreement (bukan langsung ke VIDA)
+		agreementURL := fmt.Sprintf("%s/esign-agreement?id=%s",
+			s.cfg.App.FrontendURL, appID)
+		if err := s.notifSvc.SendESignLink(context.Background(), app, agreementURL, deadline); err != nil {
 			s.log.Warn("eSign email failed", zap.Error(err))
 		}
 	}
@@ -283,8 +304,10 @@ func (s *contractService) initiateMockContract(
 	}
 
 	if s.notifSvc != nil {
+		agreementURL := fmt.Sprintf("%s/esign-agreement?id=%s",
+			s.cfg.App.FrontendURL, appID)
 		if err := s.notifSvc.SendESignLink(
-			context.Background(), app, mockSignLink, deadline,
+			context.Background(), app, agreementURL, deadline,
 		); err != nil {
 			s.log.Warn("eSign email failed", zap.Error(err))
 		}
@@ -385,6 +408,78 @@ func (s *contractService) FailContract(ctx context.Context, vidaTransactionID st
 		NewValue:    model.JSON{"status": "APPROVED", "reason": reason},
 	})
 	return nil
+}
+
+// ─── GetContractForAgreement ─────────────────────────────────────────────────
+
+func (s *contractService) GetContractForAgreement(ctx context.Context, appID string) (*ContractAgreementData, error) {
+	app, err := s.appRepo.FindByIDWithDetails(ctx, appID)
+	if err != nil {
+		if errors.Is(err, repository.ErrApplicationNotFound) {
+			return nil, ErrApplicationNotFound
+		}
+		return nil, fmt.Errorf("load application failed: %w", err)
+	}
+
+	// Hanya application berstatus SIGNING yang boleh diakses
+	if app.Status != model.StatusSigning {
+		return nil, ErrStepNotComplete
+	}
+
+	customerName := "Nasabah"
+	if app.Customer.FullName != nil {
+		customerName = *app.Customer.FullName
+	}
+
+	tosAccepted := false
+	if app.ContractDocument != nil {
+		tosAccepted = app.ContractDocument.ESignTOSAccepted
+	}
+
+	return &ContractAgreementData{
+		ApplicationID:      appID,
+		CustomerName:       customerName,
+		ProductType:        string(app.ProductType),
+		SignDeadline:       app.SignDeadline,
+		TOSAlreadyAccepted: tosAccepted,
+	}, nil
+}
+
+// ─── AcceptESignTOS ───────────────────────────────────────────────────────────
+
+func (s *contractService) AcceptESignTOS(ctx context.Context, appID string, ip string) (string, error) {
+	// 1. Pastikan contract ada dan app berstatus SIGNING
+	doc, err := s.contractRepo.FindContractByAppID(ctx, appID)
+	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			return "", ErrApplicationNotFound
+		}
+		return "", fmt.Errorf("find contract failed: %w", err)
+	}
+
+	if doc.SignLink == nil || *doc.SignLink == "" {
+		return "", fmt.Errorf("sign link belum tersedia")
+	}
+
+	signLink := *doc.SignLink
+
+	// 2. Simpan flag TOS (idempotent — aman jika dipanggil berkali-kali)
+	if err := s.contractRepo.AcceptESignTOS(ctx, appID, ip); err != nil {
+		if !errors.Is(err, repository.ErrNotFound) {
+			return "", fmt.Errorf("save tos failed: %w", err)
+		}
+	}
+
+	s.writeAudit(ctx, &model.AuditLog{
+		ActorType:   "customer",
+		Action:      "ESIGN_TOS_ACCEPTED",
+		EntityType:  strPtrIfNotEmpty("application"),
+		EntityID:    strPtrIfNotEmpty(appID),
+		IPAddress:   strPtrIfNotEmpty(ip),
+		Description: strPtrIfNotEmpty("Nasabah menyetujui syarat & ketentuan eSign VIDA"),
+	})
+
+	return signLink, nil
 }
 
 // ─── Private helpers ──────────────────────────────────────────────────────────

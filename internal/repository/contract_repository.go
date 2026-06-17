@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/cappyHoding/ptdpn-eform-service/internal/model"
 	"gorm.io/gorm"
@@ -15,6 +16,8 @@ type ContractRepository interface {
 	FindContractByAppID(ctx context.Context, appID string) (*model.ContractDocument, error)
 	FindContractBySignTrxID(ctx context.Context, signTrxID string) (*model.ContractDocument, error)
 	UpdateContract(ctx context.Context, doc *model.ContractDocument) error
+	// AcceptESignTOS menyimpan flag persetujuan TOS eSign nasabah ke contract_documents.
+	AcceptESignTOS(ctx context.Context, appID string, ip string) error
 	CreateWebhookEvent(ctx context.Context, event *model.WebhookEvent) error
 	FindWebhookByVidaEventID(ctx context.Context, vidaEventID string) (*model.WebhookEvent, error)
 	UpdateWebhookEvent(ctx context.Context, event *model.WebhookEvent) error
@@ -69,6 +72,26 @@ func (r *contractRepository) UpdateContract(ctx context.Context, doc *model.Cont
 	}
 	return nil
 }
+
+func (r *contractRepository) AcceptESignTOS(ctx context.Context, appID string, ip string) error {
+	now := time.Now()
+	result := r.db.WithContext(ctx).
+		Model(&model.ContractDocument{}).
+		Where("application_id = ? AND deleted_at IS NULL", appID).
+		Updates(map[string]interface{}{
+			"esign_tos_accepted":    true,
+			"esign_tos_accepted_at": now,
+			"esign_tos_ip":          ip,
+		})
+	if result.Error != nil {
+		return fmt.Errorf("accept esign tos failed: %w", result.Error)
+	}
+	if result.RowsAffected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 
 func (r *contractRepository) CreateWebhookEvent(ctx context.Context, event *model.WebhookEvent) error {
 	if err := r.db.WithContext(ctx).Create(event).Error; err != nil {

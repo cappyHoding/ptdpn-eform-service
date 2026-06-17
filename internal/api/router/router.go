@@ -108,7 +108,10 @@ func setupCustomerRoutes(v1 *gin.RouterGroup, deps Dependencies) {
 
 	apps.GET("/track", h.Application.TrackStatus)
 
+	// Payment proof & eSign agreement — PUBLIC (no session needed)
 	apps.POST("/:id/payment-proof", h.Application.UploadPaymentProof)
+	apps.GET("/:id/esign-agreement", h.Application.GetESignAgreement)
+	apps.POST("/:id/esign-tos", h.Application.AcceptESignTOS)
 
 	// Steps 3-7 — Require valid X-Session-Token header
 	// The session middleware validates the token and binds it to the application ID

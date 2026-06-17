@@ -44,6 +44,7 @@ type AppConfig struct {
 	Env         string   // APP_ENV: development | staging | production
 	Port        int      // APP_PORT
 	BaseURL     string   // APP_BASE_URL
+	FrontendURL string   // FRONTEND_URL — base URL customer frontend (untuk link agreement email)
 	CORSOrigins []string // CORS_ALLOWED_ORIGINS (comma-separated)
 }
 
@@ -255,10 +256,11 @@ func Load() (*Config, error) {
 
 	// ── Application ──────────────────────────────────────────────────────────
 	cfg.App = AppConfig{
-		Name:    v.GetString("APP_NAME"),
-		Env:     v.GetString("APP_ENV"),
-		Port:    v.GetInt("APP_PORT"),
-		BaseURL: v.GetString("APP_BASE_URL"),
+		Name:        v.GetString("APP_NAME"),
+		Env:         v.GetString("APP_ENV"),
+		Port:        v.GetInt("APP_PORT"),
+		BaseURL:     v.GetString("APP_BASE_URL"),
+		FrontendURL: v.GetString("FRONTEND_URL"),
 	}
 	if raw := v.GetString("CORS_ALLOWED_ORIGINS"); raw != "" {
 		for _, o := range strings.Split(raw, ",") {
