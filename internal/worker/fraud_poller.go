@@ -124,15 +124,15 @@ func (p *FraudPoller) checkOne(ctx context.Context, app *model.Application) erro
 		return nil
 
 	case "003", "007":
-		// Approved + sertifikat terbit → simpan kyc_event_id
 		if err := p.appRepo.UpdateLivenessFraudStatus(
 			ctx, app.ID, statusResult.Status, statusResult.KYCEventID,
 		); err != nil {
 			return fmt.Errorf("UpdateLivenessFraudStatus failed: %w", err)
 		}
 
+		// ── Kirim SMS notifikasi sertifikat elektronik terbit ─────────────────
 		if p.sms != nil {
-			go p.sendCertificateSMS(ctx, &app)
+			go p.sendCertificateSMS(ctx, app)
 		}
 
 		p.log.Info("Fraud APPROVED — kyc_event_id saved",
