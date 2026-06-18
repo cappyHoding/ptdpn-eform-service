@@ -1,11 +1,6 @@
 #!/bin/bash
 
-if [ -z "$1" ]; then
-  echo "Usage: ./scripts/setup-staging-env.sh <STAGING_IP>"
-  exit 1
-fi
-
-IP=$1
+IP="192.168.88.58"
 ENV_FILE=".env"
 
 echo "Generating .env for staging at $IP..."
