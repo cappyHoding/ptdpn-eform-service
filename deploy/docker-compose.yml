@@ -1,0 +1,139 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# BPR Perdana E-Form — Docker Compose (Staging)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# USAGE (dari ~/eform/):
+#   docker compose build           Build semua images
+#   docker compose up -d           Start semua services
+#   docker compose ps              Cek status
+#   docker compose logs -f backend Lihat log backend
+#   docker compose down            Stop semua (data aman)
+#
+# STRUKTUR DIRECTORY:
+#   ~/eform/
+#   ├── backend/               ← ptdpn-eform-service
+#   ├── frontend-customer/     ← bprperdana-eform
+#   ├── frontend-admin/        ← ptdpn-eform-admin
+#   ├── nginx/
+#   │   └── default.conf
+#   └── docker-compose.yml     ← FILE INI (copy dari backend/deploy/)
+#
+# SETUP:
+#   cd ~/eform
+#   cp backend/deploy/docker-compose.yml .
+#   cp -r backend/deploy/nginx .
+#   docker compose up -d
+
+services:
+
+  # ── MySQL 8.0 ──────────────────────────────────────────────────────────────
+  mysql:
+    image: mysql:8.0
+    container_name: eform-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rootpassword123}
+      MYSQL_DATABASE: bpr_perdana_eform
+      MYSQL_USER: eform_user
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-eform_password}
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./backend/migrations:/docker-entrypoint-initdb.d
+    command: >
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+      --default-authentication-plugin=mysql_native_password
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - eform-net
+
+  # ── Redis ──────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: eform-redis
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - eform-net
+
+  # ── Backend API (Go) ──────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: eform-backend
+    restart: unless-stopped
+    env_file: ./backend/.env
+    environment:
+      # Override host karena di dalam Docker network, service saling
+      # berkomunikasi via nama service, bukan localhost
+      DB_HOST: mysql
+      REDIS_HOST: redis
+    volumes:
+      - app_storage:/var/app/storage
+      - ./backend/keys:/app/keys:ro
+      - ./backend/assets:/app/assets:ro
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - eform-net
+
+  # ── Frontend Customer (React) ─────────────────────────────────────────────
+  customer:
+    build:
+      context: ./frontend-customer
+      dockerfile: Dockerfile
+    container_name: eform-customer
+    restart: unless-stopped
+    networks:
+      - eform-net
+
+  # ── Frontend Admin (React) ────────────────────────────────────────────────
+  admin:
+    build:
+      context: ./frontend-admin
+      dockerfile: Dockerfile
+    container_name: eform-admin
+    restart: unless-stopped
+    ports:
+      - "3001:80"
+    networks:
+      - eform-net
+
+  # ── NGINX Reverse Proxy ───────────────────────────────────────────────────
+  nginx:
+    image: nginx:alpine
+    container_name: eform-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - backend
+      - customer
+    networks:
+      - eform-net
+
+networks:
+  eform-net:
+    driver: bridge
+
+volumes:
+  mysql_data:
+  redis_data:
+  app_storage:
